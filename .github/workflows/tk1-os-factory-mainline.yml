@@ -1,0 +1,82 @@
+name: Jetson TK1 OS Factory - Variant B (Mainline Kernel + Nouveau)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          qemu-user-static binfmt-support debootstrap \
+          wget rsync e2fsprogs dosfstools \
+          device-tree-compiler parted zip bc build-essential
+
+    - name: Build mainline kernel (6.x)
+      run: |
+        wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz
+        tar xf linux-6.6.tar.xz
+        cd linux-6.6
+        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- tegra_defconfig
+        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j$(nproc)
+        mkdir ../kernel-out
+        cp arch/arm/boot/zImage ../kernel-out/
+        cp arch/arm/boot/dts/tegra124-jetson-tk1.dtb ../kernel-out/
+
+    - name: Build Debian 12 rootfs
+      run: |
+        sudo mkdir debian-rootfs
+        sudo debootstrap --arch=armhf bookworm debian-rootfs http://deb.debian.org/debian
+        sudo cp /usr/bin/qemu-arm-static debian-rootfs/usr/bin/
+
+    - name: Configure Debian
+      run: |
+        sudo chroot debian-rootfs /bin/bash -c "
+          echo 'jetson-tk1' > /etc/hostname
+          apt-get update
+          apt-get install -y locales sudo net-tools iproute2 openssh-server ca-certificates \
+            curl gnupg mesa-utils
+          locale-gen en_US.UTF-8
+        "
+
+    - name: Install Docker CE
+      run: |
+        sudo chroot debian-rootfs /bin/bash -c "
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo 'deb [arch=armhf signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable' \
+            > /etc/apt/sources.list.d/docker.list
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io
+        "
+
+    - name: Build rootfs.ext4
+      run: |
+        dd if=/dev/zero of=rootfs.ext4 bs=1M count=4096
+        mkfs.ext4 rootfs.ext4
+        mkdir mnt
+        sudo mount -o loop rootfs.ext4 mnt
+        sudo rsync -av debian-rootfs/ mnt/
+        sudo umount mnt
+
+    - name: Create ZIP package
+      run: |
+        mkdir output
+        cp rootfs.ext4 output/
+        cp kernel-out/zImage output/
+        cp kernel-out/tegra124-jetson-tk1.dtb output/
+        zip -r variantB.zip output
+
+    - name: Release ZIP
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: tk1-variantB
+        name: Jetson TK1 Variant B (Mainline Kernel + Nouveau)
+        files: mainline.zip

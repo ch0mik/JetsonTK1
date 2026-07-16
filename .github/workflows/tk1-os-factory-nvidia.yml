@@ -1,0 +1,93 @@
+name: Jetson TK1 OS Factory - Variant A (NVIDIA Kernel + CUDA)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          qemu-user-static binfmt-support debootstrap \
+          wget rsync e2fsprogs dosfstools \
+          device-tree-compiler parted zip
+
+    - name: Download L4T 21.8
+      run: |
+        wget --content-disposition "https://developer.nvidia.com/linux-tegra-r218" -O Tegra124_Linux_R21.8.0_armhf.tbz2
+        wget --content-disposition "https://developer.nvidia.com/linux-tegra-sample-root-filesystem-r218" -O Tegra_Linux_Sample-Root-Filesystem_R21.8.0_armhf.tbz2
+        tar xjf Tegra124_Linux_R21.8.0_armhf.tbz2
+
+    - name: Extract L4T rootfs
+      run: |
+        cd Linux_for_Tegra/rootfs
+        sudo tar xjf ../../Tegra_Linux_Sample-Root-Filesystem_R21.8.0_armhf.tbz2
+        cd ..
+        sudo ./apply_binaries.sh
+
+    - name: Build Debian 12 rootfs
+      run: |
+        sudo mkdir debian-rootfs
+        sudo debootstrap --arch=armhf bookworm debian-rootfs http://deb.debian.org/debian
+        sudo cp /usr/bin/qemu-arm-static debian-rootfs/usr/bin/
+
+    - name: Configure Debian
+      run: |
+        sudo chroot debian-rootfs /bin/bash -c "
+          echo 'jetson-tk1' > /etc/hostname
+          apt-get update
+          apt-get install -y locales sudo net-tools iproute2 openssh-server ca-certificates \
+            ocl-icd-libopencl1 curl gnupg
+          locale-gen en_US.UTF-8
+        "
+
+    - name: Install Docker CE
+      run: |
+        sudo chroot debian-rootfs /bin/bash -c "
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo 'deb [arch=armhf signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable' \
+            > /etc/apt/sources.list.d/docker.list
+          apt-get update
+          apt-get install -y docker-ce docker-ce-cli containerd.io
+        "
+
+    - name: Inject Tegra drivers and CUDA 6.5
+      run: |
+        sudo rsync -av Linux_for_Tegra/rootfs/usr/lib/arm-linux-gnueabihf/tegra/ debian-rootfs/usr/lib/arm-linux-gnueabihf/tegra/
+        sudo rsync -av Linux_for_Tegra/rootfs/lib/firmware/ debian-rootfs/lib/firmware/
+        sudo rsync -av Linux_for_Tegra/rootfs/lib/modules/ debian-rootfs/lib/modules/
+        sudo rsync -av Linux_for_Tegra/rootfs/usr/local/cuda-6.5 debian-rootfs/usr/local/
+
+    - name: Build rootfs.ext4
+      run: |
+        dd if=/dev/zero of=rootfs.ext4 bs=1M count=4096
+        mkfs.ext4 rootfs.ext4
+        mkdir mnt
+        sudo mount -o loop rootfs.ext4 mnt
+        sudo rsync -av debian-rootfs/ mnt/
+        sudo umount mnt
+
+    - name: Create ZIP package
+      run: |
+        mkdir output
+        cp rootfs.ext4 output/
+        cp Linux_for_Tegra/bootloader/zImage output/
+        cp Linux_for_Tegra/kernel/dtb/tegra124-jetson-tk1.dtb output/
+        zip -r variantA.zip output
+
+    - name: Release ZIP
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: tk1-variantA
+        name: Jetson TK1 Variant A (NVIDIA Kernel + CUDA)
+        files: nvidia.zip
+
+        
