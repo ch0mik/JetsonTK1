@@ -45,6 +45,40 @@ echo "ARMHF loader: /lib/ld-linux-armhf.so.3 -> $loader_target"
 test -x "$rootfs/usr/bin/qemu-arm-static"
 bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/true
 
+# The R21.8 userspace overlay predates Debian's merged-/usr layout. Besides
+# replacing the dynamic-loader link, it can leave systemd-udevd pointing at a
+# missing /bin/udevadm. Debian's initramfs udev hook follows that link and then
+# exits with status 1 without identifying the broken path in its normal output.
+udevadm_usr="$rootfs/usr/bin/udevadm"
+udevadm_bin="$rootfs/bin/udevadm"
+systemd_udevd="$rootfs/lib/systemd/systemd-udevd"
+if [[ ! -x "$udevadm_usr" ]]; then
+  echo "Debian udevadm is missing after apply_binaries.sh: $udevadm_usr" >&2
+  exit 1
+fi
+if [[ ! -x "$udevadm_bin" ]]; then
+  install -d -m 0755 "$rootfs/bin"
+  rm -f "$udevadm_bin"
+  ln -s ../usr/bin/udevadm "$udevadm_bin"
+fi
+if [[ ! -e "$systemd_udevd" && ! -L "$systemd_udevd" ]]; then
+  install -d -m 0755 "$(dirname "$systemd_udevd")"
+  rm -f "$systemd_udevd"
+  ln -s /bin/udevadm "$systemd_udevd"
+fi
+if ! bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/bash -c \
+  'test -x /bin/udevadm && test -x /lib/systemd/systemd-udevd'; then
+  echo "failed to repair the udev executables required by initramfs-tools" >&2
+  ls -ld "$rootfs/bin" "$udevadm_bin" "$udevadm_usr" \
+    "$systemd_udevd" >&2 || true
+  exit 1
+fi
+install -d -m 0755 "$rootfs/etc/udev"
+if [[ ! -e "$rootfs/etc/udev/udev.conf" ]]; then
+  : > "$rootfs/etc/udev/udev.conf"
+fi
+echo "udev paths verified for initramfs-tools"
+
 # initramfs-tools reads /boot/config-<release> to choose a compression format.
 # The L4T installer supplies the binary kernel and headers but omits that file.
 kernel_dir=$(find "$rootfs/lib/modules" -mindepth 1 -maxdepth 1 \

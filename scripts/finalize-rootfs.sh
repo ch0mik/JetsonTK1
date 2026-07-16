@@ -20,8 +20,23 @@ grep -qx 'CONFIG_BLK_DEV_INITRD=y' "$kernel_config" || {
   echo "$kernel_config does not enable CONFIG_BLK_DEV_INITRD" >&2
   exit 1
 }
-bash "$script_dir/run-in-rootfs.sh" "$rootfs" \
-  update-initramfs -c -k "$kernel_version"
+if ! bash "$script_dir/run-in-rootfs.sh" "$rootfs" \
+  update-initramfs -v -c -k "$kernel_version"; then
+  echo "update-initramfs failed; udev path diagnostics:" >&2
+  bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/bash -c '
+    for path in \
+      /bin /bin/udevadm /usr/bin/udevadm \
+      /lib/systemd/systemd-udevd /etc/udev/udev.conf; do
+      ls -ld "$path" 2>&1 || true
+      if [ -L "$path" ]; then
+        readlink "$path" 2>&1 || true
+      fi
+    done
+    /bin/udevadm --version 2>&1 || true
+    ldd /bin/udevadm 2>&1 || true
+  ' >&2 || true
+  exit 1
+fi
 bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/bash -c \
   'lsinitramfs "$1" | grep -F "scripts/init-premount/tk1-network-installer" >/dev/null' \
   _ "/boot/initrd.img-$kernel_version"
