@@ -4,6 +4,10 @@ set -Eeuo pipefail
 export DEBIAN_FRONTEND=noninteractive
 variant=${TK1_VARIANT:?TK1_VARIANT must be nvidia or mainline}
 
+# systemd-resolved replaces resolv.conf while it is inactive in the build
+# chroot. Preserve the resolver supplied by run-in-rootfs.sh for later steps.
+install -m 0644 /etc/resolv.conf /tmp/resolv.conf.build
+
 cat > /etc/apt/sources.list <<'EOF'
 deb https://deb.debian.org/debian bookworm main contrib non-free non-free-firmware
 deb https://deb.debian.org/debian bookworm-updates main contrib non-free non-free-firmware
@@ -22,6 +26,10 @@ apt-get install -y --no-install-recommends \
   locales tzdata kmod iproute2 iptables nftables net-tools ethtool pciutils usbutils \
   e2fsprogs util-linux rsync xz-utils less vim-tiny \
   alsa-utils ax25-apps ax25-tools batctl iw rtl-sdr wireless-regdb wpasupplicant
+
+rm -f /etc/resolv.conf
+install -m 0644 /tmp/resolv.conf.build /etc/resolv.conf
+rm -f /tmp/resolv.conf.build
 
 echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
 locale-gen
