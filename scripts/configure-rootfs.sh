@@ -20,7 +20,8 @@ apt-get update
 apt-get install -y --no-install-recommends \
   systemd-sysv systemd-resolved dbus initramfs-tools sudo openssh-server ca-certificates curl gnupg \
   locales tzdata kmod iproute2 iptables nftables net-tools ethtool pciutils usbutils \
-  e2fsprogs util-linux rsync xz-utils less vim-tiny
+  e2fsprogs util-linux rsync xz-utils less vim-tiny \
+  alsa-utils ax25-apps ax25-tools batctl iw rtl-sdr wireless-regdb wpasupplicant
 
 echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
 locale-gen
@@ -38,6 +39,10 @@ EOF
 if ! id debian >/dev/null 2>&1; then
   useradd --create-home --shell /bin/bash --groups sudo debian
 fi
+for group in audio dialout plugdev; do
+  getent group "$group" >/dev/null || groupadd --system "$group"
+  usermod --append --groups "$group" debian
+done
 echo 'debian:debian' | chpasswd
 chage -d 0 debian
 
@@ -87,10 +92,92 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
+cat > /usr/local/sbin/tk1-rtl2832-mode <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+config=/etc/modprobe.d/tk1-rtl2832-sdr.conf
+mode=${1:-status}
+
+case "$mode" in
+  sdr)
+    ((EUID == 0)) || { echo "run as root: sudo tk1-rtl2832-mode sdr" >&2; exit 1; }
+    cat > "$config" <<'BLACKLIST'
+# Reserve RTL2832U devices for librtlsdr instead of the kernel DVB stack.
+blacklist dvb_usb_rtl28xxu
+blacklist rtl2832_sdr
+blacklist rtl2832
+blacklist rtl2830
+BLACKLIST
+    if ! modprobe --remove rtl2832_sdr dvb_usb_rtl28xxu rtl2832 rtl2830 2>/dev/null; then
+      rm -f "$config"
+      echo "stop DVB applications, unplug the tuner and run this command again" >&2
+      exit 1
+    fi
+    echo "RTL2832U mode: SDR (librtlsdr); reconnect the tuner, then run rtl_test"
+    ;;
+  dvb)
+    ((EUID == 0)) || { echo "run as root: sudo tk1-rtl2832-mode dvb" >&2; exit 1; }
+    rm -f "$config"
+    modprobe dvb_usb_rtl28xxu
+    echo "RTL2832U mode: kernel DVB-T; reconnect the tuner if necessary"
+    ;;
+  status)
+    if [[ -e "$config" ]]; then
+      echo "configured mode: SDR (librtlsdr)"
+    else
+      echo "configured mode: kernel DVB-T"
+    fi
+    lsmod | grep -E 'dvb_usb_rtl28xxu|rtl283[02](_sdr)?' || true
+    ;;
+  *)
+    echo "usage: tk1-rtl2832-mode sdr|dvb|status" >&2
+    exit 2
+    ;;
+esac
+EOF
+chmod 0755 /usr/local/sbin/tk1-rtl2832-mode
+
+cat > /usr/local/sbin/tk1-set-callsign <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+((EUID == 0)) || { echo "run as root: sudo tk1-set-callsign CALLSIGN" >&2; exit 1; }
+callsign=${1:?usage: tk1-set-callsign CALLSIGN}
+callsign=$(printf '%s' "$callsign" | tr '[:lower:]' '[:upper:]')
+if [[ ! "$callsign" =~ ^[A-Z0-9]{1,6}(-([0-9]|1[0-5]))?$ ]]; then
+  echo "invalid AX.25 callsign: $callsign (expected CALL or CALL-0..15)" >&2
+  exit 2
+fi
+
+cat > /etc/default/tk1-hamradio <<CONFIG
+CALLSIGN=$callsign
+MESH_ID=HAMNET
+CONFIG
+install -d -m 0755 /etc/ax25
+cat > /etc/ax25/axports <<CONFIG
+# name  callsign  speed  paclen  window  description
+radio   $callsign  9600   255     2       Jetson TK1 AX.25 port
+CONFIG
+
+echo "AX.25 callsign set to $callsign"
+echo "reattach the KISS port or restart AX.25 services to apply it"
+EOF
+chmod 0755 /usr/local/sbin/tk1-set-callsign
+/usr/local/sbin/tk1-set-callsign N0CALL
+
 mkdir -p /etc/systemd/network /etc/systemd/system/serial-getty@ttyS0.service.d
 cat > /etc/systemd/network/20-wired.network <<'EOF'
 [Match]
 Name=en* eth*
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+EOF
+cat > /etc/systemd/network/25-wireless.network <<'EOF'
+[Match]
+Name=wl*
 
 [Network]
 DHCP=yes
@@ -103,7 +190,9 @@ ExecStart=-/sbin/agetty -o '-p -- \\u' 115200,57600,38400,9600 - $TERM
 EOF
 
 install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/debian/gpg \
+curl --fail --silent --show-error --location \
+  --retry 5 --retry-all-errors --connect-timeout 30 \
+  https://download.docker.com/linux/debian/gpg \
   -o /etc/apt/keyrings/docker.asc
 chmod a+r /etc/apt/keyrings/docker.asc
 cat > /etc/apt/sources.list.d/docker.sources <<'EOF'

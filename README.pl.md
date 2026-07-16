@@ -17,6 +17,68 @@ uruchamiany z karty SD lub istniejącej partycji boot eMMC, a Debian montuje SSD
 
 Oba warianty zawierają Debian 12, SSH, sieć DHCP, konsolę szeregową i Docker
 CE. Docker używa sterownika `vfs` z kernelem NVIDIA oraz `overlay2` z mainline.
+Kernel mainline zawiera moduły AX.25 dla packet radio, w tym KISS, 6PACK i BPQ
+Ethernet. Zawiera też firmware i sterowniki popularnych kart Wi-Fi Realtek,
+pamięci masowej USB, kart dźwiękowych USB, adapterów szeregowych USB oraz
+tunerów RTL2832U używanych jako RTL-SDR.
+
+Dla sieci HAMNET kernel mainline obsługuje natywny mesh Wi-Fi 802.11s,
+BATMAN-adv (BATMAN IV/V, BLA, DAT i optymalizację multicastu) oraz VLAN 802.1Q.
+W obrazie znajduje się też `batctl`. Przed budową węzła sprawdź, czy karta
+udostępnia tryb `mesh point`:
+
+```bash
+iw list
+```
+
+Przykładowe utworzenie interfejsu (częstotliwość i szerokość kanału dobierz
+zgodnie z pozwoleniem, bandplanem i konfiguracją lokalnej sieci HAMNET):
+
+```bash
+frequency_mhz=2412  # zmień zgodnie z lokalnym bandplanem HAMNET
+sudo iw phy phy0 interface add mesh0 type mp
+sudo ip link set mesh0 up
+sudo iw dev mesh0 mesh join HAMNET freq "$frequency_mhz" HT20
+sudo modprobe batman-adv
+sudo batctl meshif bat0 interface add mesh0
+sudo ip link set bat0 up
+```
+
+Nie każdy układ Realtek i nie każdy jego firmware wspiera tryb mesh lub
+jednoczesną pracę interfejsów station/mesh; wynik `iw list` jest rozstrzygający.
+
+### Znak wywoławczy
+
+Domyślny znak AX.25 to neutralny `N0CALL`. Jest zapisany w
+`/etc/default/tk1-hamradio` oraz jako znak portu `radio` w
+`/etc/ax25/axports`. Aby zmienić go po instalacji, uruchom na Jetsonie:
+
+```bash
+new_callsign=SQ7MRU  # tutaj wpisz swój znak zamiast N0CALL
+sudo tk1-set-callsign "$new_callsign"
+cat /etc/default/tk1-hamradio
+cat /etc/ax25/axports
+```
+
+Dozwolony jest znak bazowy do sześciu znaków oraz opcjonalny SSID od `-0` do
+`-15`, na przykład `SQ7MRU-7`. Po zmianie ponownie podłącz port KISS albo
+zrestartuj usługi AX.25. `MESH_ID=HAMNET` pozostaje wspólne dla wszystkich
+węzłów mesh i nie powinno być zastępowane indywidualnym znakiem.
+
+Tuner RTL2832U może działać jako urządzenie DVB-T sterowane przez kernel albo
+bezpośrednio przez `librtlsdr`, ale nie w obu trybach jednocześnie. Domyślnie
+aktywny jest DVB-T. Tryb można przełączyć poleceniami:
+
+```bash
+sudo tk1-rtl2832-mode sdr  # rtl_test, rtl_fm, rtl_tcp itd.
+sudo tk1-rtl2832-mode dvb  # powrót do kernelowego DVB-T
+tk1-rtl2832-mode status
+```
+
+Tryb SDR tworzy blacklistę dla `dvb_usb_rtl28xxu`, `rtl2832_sdr`, `rtl2832` i
+`rtl2830`. Po przełączeniu odłącz i ponownie podłącz tuner. Konstrukcja
+`sudo echo ... > /etc/modprobe.d/...` jest niepoprawna, ponieważ przekierowanie
+nie działa z uprawnieniami `sudo`; przy ręcznej konfiguracji użyj `sudo tee`.
 
 > [!WARNING]
 > Obrazy hybrydowe nie są oficjalnymi wydaniami NVIDIA ani Debiana. Stos
@@ -44,6 +106,38 @@ jetson-tk1-<variant>-debian12-boot-files.tar.xz
 jetson-tk1-<variant>-debian12-manifest.txt
 SHA256SUMS
 ```
+
+### Budowanie lokalne
+
+Ten sam zestaw artefaktów można zbudować lokalnie na 64-bitowym Debianie lub
+Ubuntu. Skrypt sprawdza wymagane pakiety, doinstalowuje braki przez `apt`,
+włącza emulację ARM QEMU, buduje rootfs i kernel oraz weryfikuje wynik tak jak
+workflow GitHub Actions. Wymagane są `sudo`, dostęp do Internetu, obsługa
+mountów loop i około 25 GiB wolnego miejsca.
+
+```bash
+# Linux 6.12.95 + Nouveau
+bash ./scripts/build-local.sh mainline
+
+# NVIDIA L4T 21.8 + CUDA 6.5
+bash ./scripts/build-local.sh nvidia
+```
+
+Wyniki trafiają odpowiednio do `release/mainline/` lub `release/nvidia/`.
+Parametry można zmienić, na przykład:
+
+```bash
+bash ./scripts/build-local.sh mainline \
+  --kernel-version 6.12.95 \
+  --rootfs-size-mib 14336 \
+  --jobs 8 \
+  --keep-work
+```
+
+Pełną listę opcji pokazuje `bash ./scripts/build-local.sh --help`. Nie uruchamiaj
+skryptu z Git Bash ani bezpośrednio z Windows; użyj natywnego Linuxa lub maszyny
+wirtualnej z dostępem do loop mountów. WSL może działać tylko wtedy, gdy jego
+środowisko pozwala na `binfmt_misc`, chroot i montowanie urządzeń loop.
 
 Archiwum boot zawiera `boot/zImage`, initramfs,
 `tegra124-jetson-tk1.dtb` i `boot/extlinux/extlinux.conf`. Plik L4T

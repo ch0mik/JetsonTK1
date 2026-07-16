@@ -17,6 +17,68 @@ or an existing eMMC boot partition; Debian mounts the SSD at `/dev/sda1` as `/`.
 Both variants contain Debian 12, SSH, DHCP networking, a serial console and
 Docker CE. Docker uses `vfs` on the NVIDIA kernel for compatibility and
 `overlay2` on mainline.
+The mainline kernel includes AX.25 packet-radio modules, including KISS, 6PACK
+and BPQ Ethernet support. It also includes firmware and drivers for common
+Realtek Wi-Fi adapters, USB storage, USB audio, USB serial adapters and RTL2832U
+devices used as RTL-SDR receivers.
+
+For HAMNET networks, the mainline kernel supports native 802.11s Wi-Fi mesh,
+BATMAN-adv (BATMAN IV/V, BLA, DAT and multicast optimisation), and 802.1Q VLANs.
+The image also includes `batctl`. Check that the adapter advertises `mesh point`
+mode before building a node:
+
+```bash
+iw list
+```
+
+Example setup (select frequency and channel width according to your licence,
+band plan, and local HAMNET configuration):
+
+```bash
+frequency_mhz=2412  # replace according to the local HAMNET band plan
+sudo iw phy phy0 interface add mesh0 type mp
+sudo ip link set mesh0 up
+sudo iw dev mesh0 mesh join HAMNET freq "$frequency_mhz" HT20
+sudo modprobe batman-adv
+sudo batctl meshif bat0 interface add mesh0
+sudo ip link set bat0 up
+```
+
+Not every Realtek chipset and firmware supports mesh mode or concurrent
+station/mesh interfaces; the capabilities reported by `iw list` are decisive.
+
+### Callsign
+
+The default AX.25 callsign is the neutral `N0CALL`. It is stored in
+`/etc/default/tk1-hamradio` and as the `radio` port callsign in
+`/etc/ax25/axports`. To change it after installation, run on the Jetson:
+
+```bash
+new_callsign=SQ7MRU  # enter your callsign here instead of N0CALL
+sudo tk1-set-callsign "$new_callsign"
+cat /etc/default/tk1-hamradio
+cat /etc/ax25/axports
+```
+
+The base callsign may contain up to six characters, with an optional SSID from
+`-0` to `-15`, for example `SQ7MRU-7`. Reattach the KISS port or restart AX.25
+services after changing it. `MESH_ID=HAMNET` remains common to all mesh nodes
+and should not be replaced with an individual callsign.
+
+An RTL2832U tuner can be controlled by the kernel DVB-T stack or directly by
+`librtlsdr`, but not by both at once. Kernel DVB-T is the default. Switch modes
+with:
+
+```bash
+sudo tk1-rtl2832-mode sdr  # rtl_test, rtl_fm, rtl_tcp, etc.
+sudo tk1-rtl2832-mode dvb  # restore kernel DVB-T
+tk1-rtl2832-mode status
+```
+
+SDR mode blacklists `dvb_usb_rtl28xxu`, `rtl2832_sdr`, `rtl2832` and `rtl2830`.
+Reconnect the tuner after switching. The construction
+`sudo echo ... > /etc/modprobe.d/...` is incorrect because the redirection does
+not run under `sudo`; use `sudo tee` when configuring this manually.
 
 > [!WARNING]
 > These hybrid images are not official NVIDIA or Debian releases. In
@@ -44,6 +106,38 @@ jetson-tk1-<variant>-debian12-boot-files.tar.xz
 jetson-tk1-<variant>-debian12-manifest.txt
 SHA256SUMS
 ```
+
+### Building locally
+
+The same artifacts can be built on a 64-bit Debian or Ubuntu host. The script
+checks required packages, installs missing ones with `apt`, enables ARM QEMU
+emulation, builds the rootfs and kernel, and verifies the result like the
+GitHub Actions workflows. It needs `sudo`, internet access, loop mounts and
+about 25 GiB of free space.
+
+```bash
+# Linux 6.12.95 + Nouveau
+bash ./scripts/build-local.sh mainline
+
+# NVIDIA L4T 21.8 + CUDA 6.5
+bash ./scripts/build-local.sh nvidia
+```
+
+Results are written to `release/mainline/` or `release/nvidia/`. Options can be
+overridden, for example:
+
+```bash
+bash ./scripts/build-local.sh mainline \
+  --kernel-version 6.12.95 \
+  --rootfs-size-mib 14336 \
+  --jobs 8 \
+  --keep-work
+```
+
+Run `bash ./scripts/build-local.sh --help` for all options. Do not run it from Git
+Bash or directly on Windows; use native Linux or a virtual machine with loop
+mount support. WSL can work only when its environment permits `binfmt_misc`,
+chroot and loop-device mounts.
 
 The boot files archive contains `boot/zImage`, initramfs,
 `tegra124-jetson-tk1.dtb` and `boot/extlinux/extlinux.conf`. L4T's board-specific
