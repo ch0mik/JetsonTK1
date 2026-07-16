@@ -45,6 +45,45 @@ echo "ARMHF loader: /lib/ld-linux-armhf.so.3 -> $loader_target"
 test -x "$rootfs/usr/bin/qemu-arm-static"
 bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/true
 
+# initramfs-tools reads /boot/config-<release> to choose a compression format.
+# The L4T installer supplies the binary kernel and headers but omits that file.
+kernel_dir=$(find "$rootfs/lib/modules" -mindepth 1 -maxdepth 1 \
+  -type d -name '3.10*' -print -quit)
+if [[ -z "$kernel_dir" ]]; then
+  echo "L4T kernel modules were not installed under $rootfs/lib/modules" >&2
+  exit 1
+fi
+kernel_release=${kernel_dir##*/}
+kernel_config="$rootfs/boot/config-$kernel_release"
+header_config=$(find "$rootfs/usr/src" -maxdepth 4 -type f \
+  -path "*$kernel_release*" -name .config -print -quit 2>/dev/null || true)
+
+if [[ -n "$header_config" ]]; then
+  install -m 0644 "$header_config" "$kernel_config"
+  echo "Installed L4T kernel config from ${header_config#"$rootfs"}"
+else
+  # R21.8's stock zImage uses an initial ramdisk compressed with gzip. These
+  # entries provide the metadata required by modern initramfs-tools when the
+  # legacy headers archive does not contain its original .config.
+  cat > "$kernel_config" <<EOF
+# Compatibility metadata for NVIDIA L4T R21.8 ${kernel_release}
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+EOF
+  echo "L4T headers contain no .config; installed gzip initramfs metadata"
+fi
+
+for required_option in CONFIG_BLK_DEV_INITRD CONFIG_RD_GZIP; do
+  if ! grep -qx "${required_option}=y" "$kernel_config"; then
+    echo "$kernel_config does not enable $required_option" >&2
+    exit 1
+  fi
+done
+install -d -m 0755 "$rootfs/etc/initramfs-tools/conf.d"
+cat > "$rootfs/etc/initramfs-tools/conf.d/tk1-nvidia-compression" <<'EOF'
+COMPRESS=gzip
+EOF
+
 cat > "$rootfs/tmp/install-cuda.sh" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
