@@ -1,4 +1,4 @@
-name: Jetson TK1 OS Factory - Variant B (Mainline Kernel + Nouveau)
+name: Jetson TK1 OS Factory - (Mainline Kernel + Nouveau)
 
 on:
   workflow_dispatch:

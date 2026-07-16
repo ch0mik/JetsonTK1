@@ -1,4 +1,4 @@
-name: Jetson TK1 OS Factory - Variant A (NVIDIA Kernel + CUDA)
+name: Jetson TK1 OS Factory - (NVIDIA Kernel + CUDA)
 
 on:
   workflow_dispatch:
