@@ -19,9 +19,18 @@ boot_size_mib=${BOOT_SIZE_MIB:-128}
 (( rootfs_size_mib >= 14336 )) || { echo "ROOTFS_SIZE_MIB must be at least 14336" >&2; exit 1; }
 (( boot_size_mib >= 64 )) || { echo "BOOT_SIZE_MIB must be at least 64" >&2; exit 1; }
 base="jetson-tk1-${variant}-debian12"
+pxe_local_rootfs_url='http://${serverip}:8080/'"$base-rootfs.ext4.xz"
+pxe_github_rootfs_url=${PXE_GITHUB_ROOTFS_URL:-}
+if [[ -n "$pxe_github_rootfs_url" ]] &&
+   [[ ! "$pxe_github_rootfs_url" =~ ^https://github\.com/[^[:space:]]+$ ]]; then
+  echo "PXE_GITHUB_ROOTFS_URL must be an HTTPS github.com URL without spaces" >&2
+  exit 1
+fi
 work=$(mktemp -d)
 boot_mount="$work/boot-mount"
 root_mount="$work/root-mount"
+pxe_root="$work/pxe"
+pxe_payload="$pxe_root/$base"
 
 cleanup() {
   mountpoint -q "$boot_mount" && umount "$boot_mount" || true
@@ -31,7 +40,8 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$output" "$boot_mount" "$root_mount" \
-  "$work/boot/boot/extlinux" "$work/boot/extlinux"
+  "$work/boot/boot/extlinux" "$work/boot/extlinux" \
+  "$pxe_root/pxelinux.cfg" "$pxe_payload"
 required_mib=$(du -sm "$rootfs" | awk '{print $1}')
 if (( required_mib + 256 > rootfs_size_mib )); then
   echo "rootfs needs ${required_mib} MiB; ROOTFS_SIZE_MIB=${rootfs_size_mib} is too small" >&2
@@ -61,6 +71,13 @@ LABEL primary
   APPEND ${kernel_args}
 EOF
 cp "$work/boot/boot/extlinux/extlinux.conf" "$work/boot/extlinux/extlinux.conf"
+
+install -m 0644 "$zimage" "$pxe_payload/zImage"
+install -m 0644 "$dtb" "$pxe_payload/tegra124-jetson-tk1.dtb"
+install -m 0644 "$rootfs/boot/initrd.img-$kernel_version" "$pxe_payload/initrd.img"
+cat > "$pxe_root/pxe" <<'EOF'
+U-Boot PXE bootstrap placeholder
+EOF
 
 boot_image="$work/boot.ext2"
 root_image="$work/rootfs.ext4"
@@ -103,13 +120,69 @@ build_run=${GITHUB_RUN_ID:-local}
 EOF
 
 cp "$manifest" "$work/boot/manifest.txt"
+cp "$manifest" "$pxe_payload/manifest.txt"
+xz -T0 -3 -c "$root_image" > "$output/$base-rootfs.ext4.xz"
+rootfs_sha256=$(sha256sum "$output/$base-rootfs.ext4.xz" | awk '{print $1}')
+rootfs_min_sectors=$((rootfs_size_mib * 2048))
+printf '%s  %s\n' "$rootfs_sha256" "$base-rootfs.ext4.xz" > \
+  "$pxe_payload/rootfs.sha256"
+
+cat > "$pxe_root/pxelinux.cfg/default" <<EOF
+DEFAULT jetson-tk1
+PROMPT 1
+TIMEOUT 100
+MENU TITLE Jetson TK1 ${variant} PXE
+
+LABEL jetson-tk1
+  MENU LABEL Boot Debian 12 from existing SATA /dev/sda1
+  KERNEL ${base}/zImage
+  INITRD ${base}/initrd.img
+  FDT ${base}/tegra124-jetson-tk1.dtb
+  APPEND ${kernel_args}
+
+EOF
+
+if [[ -n "$pxe_github_rootfs_url" ]]; then
+  cat >> "$pxe_root/pxelinux.cfg/default" <<EOF
+LABEL install-rootfs-github
+  MENU LABEL INSTALL rootfs from GitHub HTTPS (DESTRUCTIVE)
+  KERNEL ${base}/zImage
+  INITRD ${base}/initrd.img
+  FDT ${base}/tegra124-jetson-tk1.dtb
+  APPEND ${kernel_args} tk1_installer=1 tk1_installer_url=${pxe_github_rootfs_url} tk1_installer_sha256=${rootfs_sha256} tk1_installer_min_sectors=${rootfs_min_sectors}
+
+EOF
+fi
+
+cat >> "$pxe_root/pxelinux.cfg/default" <<EOF
+LABEL install-rootfs-local
+  MENU LABEL INSTALL rootfs from local HTTP (DESTRUCTIVE)
+  KERNEL ${base}/zImage
+  INITRD ${base}/initrd.img
+  FDT ${base}/tegra124-jetson-tk1.dtb
+  APPEND ${kernel_args} tk1_installer=1 tk1_installer_url=${pxe_local_rootfs_url} tk1_installer_sha256=${rootfs_sha256} tk1_installer_min_sectors=${rootfs_min_sectors}
+EOF
+
+cat > "$pxe_root/README-PXE.txt" <<EOF
+Extract this archive directly into the TFTP root.
+Configure DHCP to advertise this server for TFTP and pxe as the boot file.
+U-Boot pxe get will then load pxelinux.cfg/default.
+Local installer URL: ${pxe_local_rootfs_url}
+GitHub installer URL: ${pxe_github_rootfs_url:-not included in this build}
+For local HTTP, copy ${base}-rootfs.ext4.xz into this directory and expose it
+on TCP port 8080. GitHub HTTPS needs a public Release plus Internet and DNS.
+Each included installer entry verifies SHA256 and interactively writes
+/dev/sda1. The
+default entry only boots an existing rootfs.
+EOF
 tar -C "$work/boot" -cJf "$output/$base-boot-files.tar.xz" .
+tar -C "$pxe_root" -cJf "$output/$base-pxe.tar.xz" .
 xz -T0 -3 -c "$boot_disk_image" > "$output/$base-boot-sd.img.xz"
 xz -T0 -3 -c "$boot_image" > "$output/$base-boot.ext2.xz"
-xz -T0 -3 -c "$root_image" > "$output/$base-rootfs.ext4.xz"
 cp "$manifest" "$output/$base-manifest.txt"
 (cd "$output" && sha256sum \
   "$base-boot-files.tar.xz" \
+  "$base-pxe.tar.xz" \
   "$base-boot-sd.img.xz" \
   "$base-boot.ext2.xz" \
   "$base-rootfs.ext4.xz" \

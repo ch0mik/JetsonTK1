@@ -13,6 +13,9 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 test -d "$rootfs/lib/modules/$kernel_version"
 bash "$script_dir/run-in-rootfs.sh" "$rootfs" \
   update-initramfs -c -k "$kernel_version"
+bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/bash -c \
+  'lsinitramfs "$1" | grep -F "scripts/init-premount/tk1-network-installer" >/dev/null' \
+  _ "/boot/initrd.img-$kernel_version"
 
 rm -f "$rootfs/usr/bin/qemu-arm-static"
 rm -f "$rootfs/etc/ssh/ssh_host_"*

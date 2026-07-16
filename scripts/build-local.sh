@@ -165,6 +165,7 @@ mkdir -p "$work_dir" "$output"
 base="jetson-tk1-${variant}-debian12"
 rm -f -- \
   "$output/$base-boot-files.tar.xz" \
+  "$output/$base-pxe.tar.xz" \
   "$output/$base-boot-sd.img.xz" \
   "$output/$base-boot.ext2.xz" \
   "$output/$base-rootfs.ext4.xz" \
@@ -197,7 +198,7 @@ if [[ "$variant" == mainline ]]; then
   for option in \
     CONFIG_CGROUPS CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_SECCOMP \
     CONFIG_EXT4_FS CONFIG_SCSI CONFIG_BLK_DEV_SD CONFIG_ATA \
-    CONFIG_SATA_AHCI CONFIG_AHCI_TEGRA CONFIG_DRM_TEGRA \
+    CONFIG_SATA_AHCI CONFIG_AHCI_TEGRA CONFIG_R8169 CONFIG_DRM_TEGRA \
     CONFIG_DRM_TEGRA_STAGING CONFIG_NOUVEAU_PLATFORM_DRIVER \
     CONFIG_FW_LOADER CONFIG_HAMRADIO CONFIG_AX25_DAMA_SLAVE \
     CONFIG_WLAN CONFIG_WLAN_VENDOR_REALTEK CONFIG_MAC80211_MESH \
@@ -274,14 +275,33 @@ log "Verifying release payload"
 cd "$output"
 sha256sum --check SHA256SUMS
 for artifact in \
-  "$base-boot-files.tar.xz" "$base-boot-sd.img.xz" \
+  "$base-boot-files.tar.xz" "$base-pxe.tar.xz" "$base-boot-sd.img.xz" \
   "$base-boot.ext2.xz" "$base-rootfs.ext4.xz" "$base-manifest.txt"; do
   [[ -s "$artifact" ]] || die "missing or empty artifact: $artifact"
 done
 tar -xOf "$base-boot-files.tar.xz" ./boot/extlinux/extlinux.conf | \
   grep -F 'root=/dev/sda1' >/dev/null
+tar -xOf "$base-pxe.tar.xz" ./pxelinux.cfg/default | \
+  grep -F 'root=/dev/sda1' >/dev/null
+for path in \
+  ./pxe ./pxelinux.cfg/default "./$base/zImage" "./$base/initrd.img" \
+  "./$base/tegra124-jetson-tk1.dtb" "./$base/manifest.txt" \
+  "./$base/rootfs.sha256"; do
+  tar -tf "$base-pxe.tar.xz" | grep -Fx "$path" >/dev/null
+done
+pxe_config=$(tar -xOf "$base-pxe.tar.xz" ./pxelinux.cfg/default)
+grep -F 'LABEL install-rootfs-local' <<<"$pxe_config" >/dev/null
+grep -F 'tk1_installer=1' <<<"$pxe_config" >/dev/null
+grep -F 'tk1_installer_url=http://${serverip}:8080/' <<<"$pxe_config" >/dev/null
+grep -Eq 'tk1_installer_sha256=[0-9a-f]{64}' <<<"$pxe_config"
+rootfs_sha256=$(sha256sum "$base-rootfs.ext4.xz" | awk '{print $1}')
+grep -F "tk1_installer_sha256=$rootfs_sha256" <<<"$pxe_config" >/dev/null
+test "$(tar -xOf "$base-pxe.tar.xz" "./$base/rootfs.sha256" | awk '{print $1}')" = \
+  "$rootfs_sha256"
 if [[ "$variant" == nvidia ]]; then
   tar -xOf "$base-boot-files.tar.xz" ./boot/extlinux/extlinux.conf | \
+    grep -F 'mem=2015M@2048M' >/dev/null
+  tar -xOf "$base-pxe.tar.xz" ./pxelinux.cfg/default | \
     grep -F 'mem=2015M@2048M' >/dev/null
 fi
 

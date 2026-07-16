@@ -84,7 +84,7 @@ jobs:
           for option in \
             CONFIG_CGROUPS CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_SECCOMP \
             CONFIG_EXT4_FS CONFIG_SCSI CONFIG_BLK_DEV_SD CONFIG_ATA \
-            CONFIG_SATA_AHCI CONFIG_AHCI_TEGRA CONFIG_DRM_TEGRA \
+            CONFIG_SATA_AHCI CONFIG_AHCI_TEGRA CONFIG_R8169 CONFIG_DRM_TEGRA \
             CONFIG_DRM_TEGRA_STAGING CONFIG_NOUVEAU_PLATFORM_DRIVER \
             CONFIG_FW_LOADER CONFIG_HAMRADIO CONFIG_AX25_DAMA_SLAVE \
             CONFIG_WLAN CONFIG_WLAN_VENDOR_REALTEK CONFIG_MAC80211_MESH \
@@ -129,9 +129,18 @@ jobs:
           cp "$dtb" "$GITHUB_WORKSPACE/kernel-out/tegra124-jetson-tk1.dtb"
 
       - name: Finalize rootfs and create images
+        env:
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
         run: |
+          tag=${REQUESTED_TAG:-tk1-mainline-${KERNEL_VERSION}-r${GITHUB_RUN_NUMBER}}
+          PXE_GITHUB_ROOTFS_URL=
+          if [[ "$PUBLISH_RELEASE" == true ]]; then
+            PXE_GITHUB_ROOTFS_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/jetson-tk1-mainline-debian12-rootfs.ext4.xz"
+          fi
+          export PXE_GITHUB_ROOTFS_URL
           sudo bash ./scripts/finalize-rootfs.sh rootfs "$KERNEL_RELEASE"
-          sudo --preserve-env=GITHUB_SHA,GITHUB_RUN_ID,ROOTFS_SIZE_MIB \
+          sudo --preserve-env=GITHUB_SHA,GITHUB_RUN_ID,ROOTFS_SIZE_MIB,PXE_GITHUB_ROOTFS_URL \
             bash ./scripts/build-image.sh \
               rootfs mainline kernel-out/zImage \
               kernel-out/tegra124-jetson-tk1.dtb \
@@ -139,6 +148,9 @@ jobs:
           sudo chown -R "$USER:$USER" release
 
       - name: Verify release payload
+        env:
+          PUBLISH_RELEASE: ${{ inputs.publish_release }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
         run: |
           set -Eeuo pipefail
           cd release
@@ -146,9 +158,40 @@ jobs:
           test "$(find . -maxdepth 1 -name '*-boot-sd.img.xz' | wc -l)" -eq 1
           test "$(find . -maxdepth 1 -name '*-rootfs.ext4.xz' | wc -l)" -eq 1
           test "$(find . -maxdepth 1 -name '*-boot.ext2.xz' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*-pxe.tar.xz' | wc -l)" -eq 1
           tar -tf ./*-boot-files.tar.xz | grep -F './boot/extlinux/extlinux.conf' >/dev/null
           xzcat ./*-boot-files.tar.xz | tar -xOf - ./boot/extlinux/extlinux.conf | \
             grep -F 'root=/dev/sda1' >/dev/null
+          for path in \
+            ./pxe ./pxelinux.cfg/default \
+            ./jetson-tk1-mainline-debian12/zImage \
+            ./jetson-tk1-mainline-debian12/initrd.img \
+            ./jetson-tk1-mainline-debian12/tegra124-jetson-tk1.dtb \
+            ./jetson-tk1-mainline-debian12/manifest.txt \
+            ./jetson-tk1-mainline-debian12/rootfs.sha256; do
+            tar -tf ./*-pxe.tar.xz | grep -Fx "$path" >/dev/null
+          done
+          pxe_config=$(tar -xOf ./*-pxe.tar.xz ./pxelinux.cfg/default)
+          grep -F 'root=/dev/sda1' <<<"$pxe_config" >/dev/null
+          grep -F 'LABEL install-rootfs-local' <<<"$pxe_config" >/dev/null
+          grep -F 'tk1_installer=1' <<<"$pxe_config" >/dev/null
+          tag=${REQUESTED_TAG:-tk1-mainline-${KERNEL_VERSION}-r${GITHUB_RUN_NUMBER}}
+          local_url='http://${serverip}:8080/jetson-tk1-mainline-debian12-rootfs.ext4.xz'
+          grep -F "tk1_installer_url=$local_url" <<<"$pxe_config" >/dev/null
+          if [[ "$PUBLISH_RELEASE" == true ]]; then
+            github_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/jetson-tk1-mainline-debian12-rootfs.ext4.xz"
+            grep -F 'LABEL install-rootfs-github' <<<"$pxe_config" >/dev/null
+            grep -F "tk1_installer_url=$github_url" <<<"$pxe_config" >/dev/null
+          else
+            ! grep -F 'LABEL install-rootfs-github' <<<"$pxe_config" >/dev/null
+          fi
+          grep -Eq 'tk1_installer_sha256=[0-9a-f]{64}' <<<"$pxe_config"
+          rootfs_sha256=$(sha256sum ./*-rootfs.ext4.xz | awk '{print $1}')
+          grep -F "tk1_installer_sha256=$rootfs_sha256" \
+            <<<"$pxe_config" >/dev/null
+          test "$(tar -xOf ./*-pxe.tar.xz \
+            ./jetson-tk1-mainline-debian12/rootfs.sha256 | awk '{print $1}')" = \
+            "$rootfs_sha256"
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v6
@@ -184,6 +227,7 @@ jobs:
           title="Jetson TK1 Mainline ${KERNEL_VERSION} + Debian 12"
           notes=$(cat <<EOF
           Mainline Linux ${KERNEL_VERSION}, Nouveau/Mesa, Docker CE and Debian 12 armhf.
+          Includes SATA rootfs, SD/eMMC boot and PXE/TFTP deployment assets.
 
           Verify the download with \`sha256sum -c SHA256SUMS\` before flashing.
           See README.md for bootloader requirements and first-login instructions.

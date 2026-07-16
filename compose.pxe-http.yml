@@ -1,0 +1,22 @@
+services:
+  pxe-http:
+    build:
+      context: ./docker/pxe-http
+    image: jetson-tk1-pxe-http:local
+    container_name: jetson-tk1-pxe-http
+    ports:
+      - "${PXE_HTTP_BIND:-0.0.0.0}:8080:8080"
+    volumes:
+      # Host directory containing *-rootfs.ext4.xz is mounted, not copied.
+      - type: bind
+        source: ${PXE_FILES_DIR:-/srv/tftp}
+        target: /srv/files
+        read_only: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped

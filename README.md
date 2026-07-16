@@ -103,9 +103,42 @@ jetson-tk1-<variant>-debian12-boot-sd.img.xz
 jetson-tk1-<variant>-debian12-boot.ext2.xz
 jetson-tk1-<variant>-debian12-rootfs.ext4.xz
 jetson-tk1-<variant>-debian12-boot-files.tar.xz
+jetson-tk1-<variant>-debian12-pxe.tar.xz
 jetson-tk1-<variant>-debian12-manifest.txt
 SHA256SUMS
 ```
+
+### Using the generated files
+
+For normal distribution, keep these files as GitHub Release assets. A workflow
+artifact is the temporary copy used between jobs and for builds where Release
+publishing is disabled. GitHub Packages is not used because it accepts package
+manager formats and Docker/OCI images, not raw disk or filesystem images.
+
+If downloaded from **Actions**, extract the artifact ZIP first. If downloaded
+from **Releases**, put all files from one release in the same directory. Then
+verify them before writing anything to removable media:
+
+```bash
+sha256sum -c SHA256SUMS
+```
+
+The root filesystem image is required, followed by exactly one of the four
+boot deployment methods:
+
+| Generated file | Purpose and next step |
+| --- | --- |
+| `*-rootfs.ext4.xz` | Required: write it to the SATA SSD partition `/dev/sda1`. |
+| `*-boot-sd.img.xz` | Easiest option for a dedicated SD card: write it to the whole card. |
+| `*-boot.ext2.xz` | Write it to an existing dedicated boot partition; it replaces that partition. |
+| `*-boot-files.tar.xz` | Non-destructive alternative: extract the boot files onto an already formatted boot partition. |
+| `*-pxe.tar.xz` | TFTP tree with separate normal-boot and SATA rootfs installer menu entries. |
+| `*-manifest.txt` | Build metadata for identification and troubleshooting; do not flash it. |
+| `SHA256SUMS` | Checksums for verifying every generated file. |
+
+Do not deploy all four boot variants. Choose the one matching the existing
+boot-media layout, then follow **Preparing the SATA rootfs** and **Preparing
+boot media** below.
 
 ### Building locally
 
@@ -170,6 +203,11 @@ to understand the SATA filesystem. Linux mounts the SSD later as `/dev/sda1`.
 
 ## Preparing the SATA rootfs
 
+This step is required for SD/eMMC boot. Write the rootfs manually as described
+below, or use the separate PXE installer entry documented under **PXE/TFTP
+network boot and rootfs installation**. Download `*-rootfs.ext4.xz` and
+`SHA256SUMS` from the same Release.
+
 For a 128 GB SSD, the recommended layout is a large `/dev/sda1` root partition
 and a 2 GiB `/dev/sda2` swap partition. Swap is useful on the TK1's 2 GB RAM,
 especially with Docker. The image sets `vm.swappiness=10`, so normal operation
@@ -178,6 +216,16 @@ host (replace `/dev/sdX` only after verifying the target disk):
 
 ```bash
 disk=/dev/sdX
+lsblk -d -o NAME,SIZE,MODEL,SERIAL,TRAN
+lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS "$disk"
+
+# Stop if either target partition is mounted.
+if findmnt -rn -S "${disk}1" >/dev/null || \
+   findmnt -rn -S "${disk}2" >/dev/null; then
+  echo "target SSD is mounted; unmount it before continuing" >&2
+  exit 1
+fi
+
 end_mib=$(( $(sudo blockdev --getsize64 "$disk") / 1024 / 1024 ))
 swap_start_mib=$(( end_mib - 2048 ))
 sudo parted --script "$disk" mklabel gpt
@@ -186,13 +234,35 @@ sudo parted --script "$disk" unit MiB \
   mkpart swap linux-swap "$swap_start_mib" 100%
 sudo partprobe "$disk"
 
-sha256sum -c SHA256SUMS
+grep 'rootfs\.ext4\.xz$' SHA256SUMS | sha256sum -c -
 xzcat jetson-tk1-mainline-debian12-rootfs.ext4.xz | \
 sudo dd of="${disk}1" bs=4M iflag=fullblock oflag=direct status=progress
 sudo e2fsck -f "${disk}1"
 sudo mkswap -L swap "${disk}2"
 sync
 ```
+
+If the SSD already has a sufficiently large `/dev/sda1` and optional
+`/dev/sda2`, do not recreate its partition table. On the Jetson rescue system,
+place the downloaded files on another filesystem and use:
+
+```bash
+grep 'rootfs\.ext4\.xz$' SHA256SUMS | sha256sum -c -
+if findmnt -rn -S /dev/sda1 >/dev/null; then
+  echo "/dev/sda1 is mounted; refusing to overwrite it" >&2
+  exit 1
+fi
+xzcat jetson-tk1-mainline-debian12-rootfs.ext4.xz | \
+  sudo dd of=/dev/sda1 bs=4M iflag=fullblock oflag=direct status=progress
+sudo e2fsck -f /dev/sda1
+sudo mkswap -L swap /dev/sda2  # omit when there is no swap partition
+sync
+```
+
+`*-rootfs.ext4.xz` is a filesystem image, not a whole-disk image. Always write
+it to `/dev/sda1` (or `${disk}1` on the preparation host), **never to
+`/dev/sda` or `${disk}`**. After this step, PXE can load the boot files over
+TFTP and Linux will mount the prepared SSD as its root filesystem.
 
 The root filesystem is labelled `rootfs`, but the kernel command line
 intentionally selects it as `/dev/sda1`. Swap is found by the `swap` label and
@@ -226,6 +296,197 @@ sudo umount /mnt/boot
 
 Double-check every device path. `dd` against the wrong SSD, SD card or eMMC
 partition destroys its existing contents.
+
+## PXE/TFTP network boot and rootfs installation
+
+An artifact published as a GitHub Release provides three PXE menu entries:
+
+- **Boot Debian 12 from existing SATA `/dev/sda1`** — normal default boot;
+- **INSTALL rootfs from GitHub HTTPS (DESTRUCTIVE)** — downloads directly from
+  the matching GitHub Release;
+- **INSTALL rootfs from local HTTP (DESTRUCTIVE)** — downloads from the local
+  `${serverip}:8080` server.
+
+TFTP delivers the kernel, initramfs, DTB and menu. The large
+`rootfs.ext4.xz` can come from GitHub HTTPS or local HTTP and is streamed
+through `xz | dd` with retries and SHA-256 checking. A build without Release
+publishing only includes the local entry because no GitHub asset exists yet.
+
+The example below uses an isolated provisioning network, server address
+`192.168.50.1` and interface `enp3s0`. Adjust them for the server. Never start
+a second DHCP service on a normal home or office network.
+
+### Step 1: prepare the files
+
+Always download the PXE archive and `SHA256SUMS` from the same Release, verify
+the archive and extract it:
+
+```bash
+grep -- '-pxe\.tar\.xz$' SHA256SUMS | sha256sum -c -
+sudo install -d -m 0755 /srv/tftp
+sudo tar -xJf jetson-tk1-mainline-debian12-pxe.tar.xz -C /srv/tftp
+find /srv/tftp -maxdepth 3 -type f -print
+```
+
+For local HTTP only, also download, verify and copy the rootfs:
+
+```bash
+grep -- '-rootfs\.ext4\.xz$' SHA256SUMS | sha256sum -c -
+sudo install -m 0644 jetson-tk1-mainline-debian12-rootfs.ext4.xz /srv/tftp/
+```
+
+Use `nvidia` instead of `mainline` for the NVIDIA variant. The same directory
+is served through TFTP and HTTP:
+
+```text
+/srv/tftp/
+├── pxelinux.cfg/default
+├── README-PXE.txt
+├── pxe
+├── jetson-tk1-mainline-debian12-rootfs.ext4.xz  # local HTTP only
+└── jetson-tk1-mainline-debian12/
+    ├── zImage
+    ├── initrd.img
+    ├── tegra124-jetson-tk1.dtb
+    ├── manifest.txt
+    └── rootfs.sha256
+```
+
+### Step 2: start DHCP and TFTP
+
+The Jetson needs U-Boot with Ethernet, DHCP, TFTP and the `pxe` command.
+`dnsmasq` provides a simple server for a dedicated interface:
+
+```bash
+sudo apt-get install dnsmasq python3
+sudo ip address add 192.168.50.1/24 dev enp3s0
+sudo ip link set enp3s0 up
+```
+
+Create `/etc/dnsmasq.d/jetson-tk1-pxe.conf`:
+
+```ini
+interface=enp3s0
+bind-interfaces
+dhcp-range=192.168.50.20,192.168.50.50,255.255.255.0,1h
+dhcp-option=3
+enable-tftp
+tftp-root=/srv/tftp
+dhcp-boot=pxe
+log-dhcp
+```
+
+The empty `dhcp-option=3` avoids advertising a gateway on the isolated link, so
+this configuration is intended for local HTTP installation. GitHub download
+requires DHCP to provide a working gateway and DNS plus Internet access. If
+DHCP already exists, do not start another server: configure its next-server or
+option 66 for TFTP and boot filename or option 67 as `pxe`.
+
+```bash
+sudo dnsmasq --test
+sudo systemctl restart dnsmasq
+sudo journalctl -u dnsmasq -f
+```
+
+### Step 3: select the image source
+
+**GitHub HTTPS:** do not start local HTTP. Ensure the Release is public and the
+Jetson receives a gateway and DNS from DHCP and can reach `github.com`. Select
+**INSTALL rootfs from GitHub HTTPS** in the menu. GitHub Actions embeds the
+exact Release tag and asset URL in the PXE artifact. The Jetson RTC must hold a
+valid date for TLS certificate verification; correct it or use local HTTP if
+the installer reports an invalid clock.
+
+**Local HTTP:** this also works without Internet. The recommended server is
+defined by `docker/pxe-http/Dockerfile`; `compose.pxe-http.yml` mounts
+`/srv/tftp` read-only. From the repository root, run:
+
+```text
+host: ${PXE_FILES_DIR:-/srv/tftp}  ->  container: /srv/files (read-only)
+```
+
+Dockerfile `ADD` or `COPY` is intentionally not used for artifacts: it would
+bake the multi-gigabyte rootfs into an image layer and require rebuilding the
+image after every file change. The bind mount exposes the host directory's
+current contents.
+
+```bash
+PXE_FILES_DIR=/srv/tftp PXE_HTTP_BIND=192.168.50.1 \
+  docker compose -f compose.pxe-http.yml up --build -d
+docker compose -f compose.pxe-http.yml ps
+curl --fail http://192.168.50.1:8080/healthz
+curl --fail --head \
+  http://192.168.50.1:8080/jetson-tk1-mainline-debian12-rootfs.ext4.xz
+```
+
+Select **INSTALL rootfs from local HTTP** in the menu. This simple server has
+no authentication or encryption. Use it only on a trusted isolated network
+and stop it after installation. TCP port 8080 must be reachable from the
+Jetson. To follow logs and stop the container:
+
+```bash
+docker compose -f compose.pxe-http.yml logs -f pxe-http
+docker compose -f compose.pxe-http.yml down
+```
+
+Without Compose, build and run the same Dockerfile directly:
+
+```bash
+docker build -t jetson-tk1-pxe-http:local docker/pxe-http
+docker run --rm --name jetson-tk1-pxe-http \
+  --read-only --tmpfs /tmp:size=16m,mode=1777 \
+  --cap-drop ALL --security-opt no-new-privileges \
+  -p 192.168.50.1:8080:8080 \
+  -v /srv/tftp:/srv/files:ro \
+  jetson-tk1-pxe-http:local
+```
+
+As a no-Docker fallback, use
+`cd /srv/tftp && python3 -m http.server 8080 --bind 192.168.50.1`.
+
+### Step 4: open the PXE menu on the serial console
+
+Connect at 115200 8N1, interrupt U-Boot autoboot and run:
+
+```text
+=> help pxe
+=> printenv pxefile_addr_r kernel_addr_r ramdisk_addr_r fdt_addr_r
+=> setenv autoload no
+=> dhcp
+=> setenv bootfile pxe
+=> pxe get
+=> pxe boot
+```
+
+Select either **GitHub HTTPS** or **local HTTP** installation with the menu
+keys. Both entries write `/dev/sda1`. The timeout starts normal boot, never the
+installer. If `help pxe` or a load address is missing, update U-Boot. Some
+distro-boot versions can also use `run bootcmd_pxe`. See the U-Boot
+[PXE format and command documentation](https://docs.u-boot.org/en/stable/usage/pxe.html).
+
+### Step 5: confirm the SSD write
+
+The installer performs these operations in order:
+
+1. downloads without writing and compares SHA-256 with the value embedded in
+   the PXE menu;
+2. displays `/dev/sda` and either preserves its partition table or, after the
+   exact `ERASE-SDA` confirmation, creates GPT rootfs plus 2 GiB swap;
+3. checks that `/dev/sda1` exists, is not mounted and is large enough;
+4. requires `WRITE-SDA1`, downloads again and streams the image to the
+   partition while also checking the second transfer's SHA-256;
+5. runs `e2fsck`, initializes optional `/dev/sda2` swap and offers to reboot.
+
+Power or network loss during the write leaves an incomplete rootfs; start the
+installer again. `ERASE-SDA` destroys all of `/dev/sda`, while normal mode
+overwrites all of `/dev/sda1`.
+
+### Step 6: boot the installed system
+
+After reboot, run `pxe get` and `pxe boot` again or configure `boot_targets`.
+Leave **Boot Debian 12 from existing SATA `/dev/sda1`** selected. TFTP supplies
+the boot files and Linux mounts the new SSD rootfs. HTTP is not needed for
+normal boot.
 
 The initial console account is `debian` with password `debian`. Login over the
 115200 baud serial console; the image forces a password change immediately.
