@@ -14,6 +14,37 @@ rm -rf "$l4t_dir/rootfs"
 ln -s "$rootfs" "$l4t_dir/rootfs"
 (cd "$l4t_dir" && ./apply_binaries.sh)
 
+# L4T R21.8 predates merged-/usr. Its apply_binaries.sh can remove the
+# top-level ARMHF interpreter link from a modern Debian rootfs, after which
+# binfmt/QEMU cannot start even /bin/sh and only reports exit status 255.
+armhf_loader=arm-linux-gnueabihf/ld-linux-armhf.so.3
+loader_link="$rootfs/lib/ld-linux-armhf.so.3"
+if [[ -e "$rootfs/lib/$armhf_loader" ]]; then
+  loader_target=$armhf_loader
+elif [[ -e "$rootfs/usr/lib/$armhf_loader" ]]; then
+  if [[ -L "$rootfs/lib" ]]; then
+    loader_target=$armhf_loader
+  else
+    loader_target="../usr/lib/$armhf_loader"
+  fi
+else
+  echo "ARMHF dynamic loader is missing after apply_binaries.sh:" >&2
+  find "$rootfs/lib" "$rootfs/usr/lib" -maxdepth 3 \
+    -name 'ld-linux-armhf.so*' -print >&2 || true
+  exit 1
+fi
+
+rm -f "$loader_link"
+ln -s "$loader_target" "$loader_link"
+if [[ ! -e "$loader_link" ]]; then
+  echo "repaired ARMHF loader link is broken: $loader_link -> $loader_target" >&2
+  exit 1
+fi
+echo "ARMHF loader: /lib/ld-linux-armhf.so.3 -> $loader_target"
+
+test -x "$rootfs/usr/bin/qemu-arm-static"
+bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/true
+
 cat > "$rootfs/tmp/install-cuda.sh" <<'EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
