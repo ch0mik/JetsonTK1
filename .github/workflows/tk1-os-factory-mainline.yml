@@ -19,6 +19,15 @@ jobs:
           wget rsync e2fsprogs dosfstools \
           device-tree-compiler parted zip bc build-essential
 
+    - name: Install ARM cross compiler
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          gcc-arm-linux-gnueabihf \
+          g++-arm-linux-gnueabihf \
+          binutils-arm-linux-gnueabihf
+
+
     - name: Build mainline kernel (6.x)
       run: |
         wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz
