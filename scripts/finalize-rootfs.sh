@@ -16,6 +16,8 @@ bash "$script_dir/run-in-rootfs.sh" "$rootfs" \
 
 rm -f "$rootfs/usr/bin/qemu-arm-static"
 rm -f "$rootfs/etc/ssh/ssh_host_"*
+rm -f "$rootfs/etc/resolv.conf"
+ln -s ../run/systemd/resolve/stub-resolv.conf "$rootfs/etc/resolv.conf"
 : > "$rootfs/etc/machine-id"
 rm -f "$rootfs/var/lib/dbus/machine-id"
 rm -rf "$rootfs/var/lib/apt/lists/"* "$rootfs/var/cache/apt/archives/"*.deb

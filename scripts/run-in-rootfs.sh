@@ -22,6 +22,7 @@ mount --rbind /sys "$rootfs/sys"
 mount --make-rslave "$rootfs/sys"
 mount --rbind /dev "$rootfs/dev"
 mount --make-rslave "$rootfs/dev"
+rm -f "$rootfs/etc/resolv.conf"
 cp --dereference /etc/resolv.conf "$rootfs/etc/resolv.conf"
 
 chroot "$rootfs" "$@"

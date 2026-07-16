@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       rootfs_size_mib:
-        description: Size of the ext4 root partition in MiB
+        description: Initial ext4 rootfs size in MiB (minimum 14336; grows on first boot)
         required: true
-        default: "4096"
+        default: "14336"
         type: string
       release_tag:
         description: Optional release tag (generated when empty)
@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install host dependencies
         run: |
@@ -63,17 +63,18 @@ jobs:
       - name: Install NVIDIA drivers and CUDA 6.5
         run: |
           sudo bash ./scripts/install-nvidia-userspace.sh rootfs Linux_for_Tegra
-          zimage=$(find Linux_for_Tegra -type f -name zImage -print -quit)
-          dtb=$(find Linux_for_Tegra -type f -name tegra124-jetson-tk1.dtb -print -quit)
-          test -n "$zimage"
-          test -n "$dtb"
+          zimage=Linux_for_Tegra/kernel/zImage
+          dtb=Linux_for_Tegra/kernel/dtb/tegra124-jetson_tk1-pm375-000-c00-00.dtb
+          test -s "$zimage"
+          test -s "$dtb"
           mkdir -p kernel-out
           cp "$zimage" kernel-out/zImage
           cp "$dtb" kernel-out/tegra124-jetson-tk1.dtb
 
-          kernel_release=$(find rootfs/lib/modules -mindepth 1 -maxdepth 1 \
-            -type d -printf '%f\n' | grep '^3\.10' | head -n 1)
-          test -n "$kernel_release"
+          kernel_dir=$(find rootfs/lib/modules -mindepth 1 -maxdepth 1 \
+            -type d -name '3.10*' -print -quit)
+          test -n "$kernel_dir"
+          kernel_release=${kernel_dir##*/}
           echo "KERNEL_RELEASE=$kernel_release" >> "$GITHUB_ENV"
 
       - name: Finalize rootfs and create images
@@ -91,13 +92,17 @@ jobs:
           set -Eeuo pipefail
           cd release
           sha256sum --check SHA256SUMS
-          test "$(find . -maxdepth 1 -name '*.img.xz' | wc -l)" -eq 1
-          test "$(find . -maxdepth 1 -name '*-components.tar.xz' | wc -l)" -eq 1
-          tar -tf ./*-components.tar.xz | grep -q './boot/extlinux/extlinux.conf'
-          tar -tf ./*-components.tar.xz | grep -q './rootfs.ext4'
+          test "$(find . -maxdepth 1 -name '*-boot-sd.img.xz' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*-rootfs.ext4.xz' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*-boot.ext2.xz' | wc -l)" -eq 1
+          tar -tf ./*-boot-files.tar.xz | grep -F './boot/extlinux/extlinux.conf' >/dev/null
+          xzcat ./*-boot-files.tar.xz | tar -xOf - ./boot/extlinux/extlinux.conf | \
+            grep -F 'root=/dev/sda1' >/dev/null
+          xzcat ./*-boot-files.tar.xz | tar -xOf - ./boot/extlinux/extlinux.conf | \
+            grep -F 'mem=2015M@2048M' >/dev/null
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: jetson-tk1-nvidia-debian12
           path: release/*
@@ -115,7 +120,7 @@ jobs:
 
     steps:
       - name: Download workflow artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: jetson-tk1-nvidia-debian12
           path: release
@@ -129,8 +134,8 @@ jobs:
           tag=${REQUESTED_TAG:-tk1-nvidia-l4t21.8-r${GITHUB_RUN_NUMBER}}
           title="Jetson TK1 NVIDIA L4T 21.8 + Debian 12"
           notes=$(cat <<'EOF'
-          NVIDIA kernel 3.10.40, proprietary Tegra drivers, CUDA 6.5, OpenCL,
-          Docker CE and Debian 12 armhf.
+          NVIDIA kernel 3.10.40, proprietary Tegra drivers, CUDA 6.5,
+          Docker CE and Debian 12 armhf. NVIDIA OpenCL is not available on TK1.
 
           This is an experimental hybrid userspace. Verify the download with
           `sha256sum -c SHA256SUMS` and read README.md before flashing.

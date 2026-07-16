@@ -9,9 +9,9 @@ on:
         default: 6.12.95
         type: string
       rootfs_size_mib:
-        description: Size of the ext4 root partition in MiB
+        description: Initial ext4 rootfs size in MiB (minimum 14336; grows on first boot)
         required: true
-        default: "4096"
+        default: "14336"
         type: string
       release_tag:
         description: Optional release tag (generated when empty)
@@ -43,7 +43,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install host dependencies
         run: |
@@ -60,6 +60,10 @@ jobs:
       - name: Download and verify kernel source
         run: |
           set -Eeuo pipefail
+          [[ "$KERNEL_VERSION" =~ ^6\.12\.[0-9]+$ ]] || {
+            echo "kernel_version must be a 6.12.x release" >&2
+            exit 1
+          }
           base_url=https://cdn.kernel.org/pub/linux/kernel/v6.x
           archive="linux-${KERNEL_VERSION}.tar.xz"
           curl --fail --location --retry 3 --remote-name "$base_url/$archive"
@@ -79,7 +83,10 @@ jobs:
 
           for option in \
             CONFIG_CGROUPS CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_SECCOMP \
-            CONFIG_EXT4_FS CONFIG_DRM_TEGRA CONFIG_FW_LOADER; do
+            CONFIG_EXT4_FS CONFIG_SCSI CONFIG_BLK_DEV_SD CONFIG_ATA \
+            CONFIG_SATA_AHCI CONFIG_AHCI_TEGRA CONFIG_DRM_TEGRA \
+            CONFIG_DRM_TEGRA_STAGING CONFIG_NOUVEAU_PLATFORM_DRIVER \
+            CONFIG_FW_LOADER; do
             grep -q "^${option}=y$" .config
           done
           for option in CONFIG_OVERLAY_FS CONFIG_BRIDGE CONFIG_VETH CONFIG_DRM_NOUVEAU; do
@@ -119,13 +126,15 @@ jobs:
           set -Eeuo pipefail
           cd release
           sha256sum --check SHA256SUMS
-          test "$(find . -maxdepth 1 -name '*.img.xz' | wc -l)" -eq 1
-          test "$(find . -maxdepth 1 -name '*-components.tar.xz' | wc -l)" -eq 1
-          tar -tf ./*-components.tar.xz | grep -q './boot/extlinux/extlinux.conf'
-          tar -tf ./*-components.tar.xz | grep -q './rootfs.ext4'
+          test "$(find . -maxdepth 1 -name '*-boot-sd.img.xz' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*-rootfs.ext4.xz' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*-boot.ext2.xz' | wc -l)" -eq 1
+          tar -tf ./*-boot-files.tar.xz | grep -F './boot/extlinux/extlinux.conf' >/dev/null
+          xzcat ./*-boot-files.tar.xz | tar -xOf - ./boot/extlinux/extlinux.conf | \
+            grep -F 'root=/dev/sda1' >/dev/null
 
       - name: Upload workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: jetson-tk1-mainline-debian12
           path: release/*
@@ -143,7 +152,7 @@ jobs:
 
     steps:
       - name: Download workflow artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: jetson-tk1-mainline-debian12
           path: release

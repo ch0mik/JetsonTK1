@@ -22,7 +22,10 @@ export DEBIAN_FRONTEND=noninteractive
 cat > /etc/apt/sources.list.d/cuda-6-5.list <<'LIST'
 deb [trusted=yes] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu1404/armhf /
 LIST
-apt-get update -o Acquire::AllowInsecureRepositories=true
+apt-get update \
+  -o Acquire::AllowInsecureRepositories=true \
+  -o Acquire::AllowWeakRepositories=true \
+  -o Acquire::Check-Valid-Until=false
 apt-get install -y --no-install-recommends --allow-unauthenticated \
   cuda-core-6-5 cuda-command-line-tools-6-5 \
   cuda-cudart-6-5 cuda-cudart-dev-6-5 \
@@ -52,8 +55,7 @@ XORG
 
 ldconfig
 test -x /usr/local/cuda-6.5/bin/nvcc
-ldconfig -p | grep -q 'libcuda\.so'
-ldconfig -p | grep -q 'libOpenCL\.so'
+ldconfig -p | grep 'libcuda\.so' >/dev/null
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 EOF

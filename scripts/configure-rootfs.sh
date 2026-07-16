@@ -18,9 +18,9 @@ chmod 0755 /usr/sbin/policy-rc.d
 
 apt-get update
 apt-get install -y --no-install-recommends \
-  systemd-sysv dbus initramfs-tools sudo openssh-server ca-certificates curl gnupg \
+  systemd-sysv systemd-resolved dbus initramfs-tools sudo openssh-server ca-certificates curl gnupg \
   locales tzdata kmod iproute2 iptables nftables net-tools ethtool pciutils usbutils \
-  rsync xz-utils less vim-tiny
+  e2fsprogs util-linux rsync xz-utils less vim-tiny
 
 echo 'en_US.UTF-8 UTF-8' > /etc/locale.gen
 locale-gen
@@ -43,7 +43,48 @@ chage -d 0 debian
 
 cat > /etc/fstab <<'EOF'
 LABEL=rootfs / ext4 defaults,noatime 0 1
-LABEL=BOOT /boot ext2 defaults,noatime 0 2
+LABEL=BOOT /boot/uboot ext2 defaults,noatime,nofail,x-systemd.device-timeout=5s 0 2
+LABEL=swap none swap sw,nofail,x-systemd.device-timeout=5s 0 0
+EOF
+mkdir -p /boot/uboot
+
+cat > /etc/sysctl.d/90-jetson-tk1-swap.conf <<'EOF'
+# Prefer RAM; use the SSD swap only under memory pressure.
+vm.swappiness=10
+EOF
+
+cat > /usr/local/sbin/tk1-grow-rootfs <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+state_dir=/var/lib/tk1-grow-rootfs
+root_source=$(findmnt --noheadings --output SOURCE /)
+root_device=$(readlink -f "$root_source")
+
+if [[ "$root_device" != /dev/sda1 ]]; then
+  echo "Root filesystem is $root_device, expected /dev/sda1; skipping resize" >&2
+  exit 0
+fi
+
+resize2fs "$root_device"
+install -d -m 0755 "$state_dir"
+touch "$state_dir/done"
+EOF
+chmod 0755 /usr/local/sbin/tk1-grow-rootfs
+
+cat > /etc/systemd/system/tk1-grow-rootfs.service <<'EOF'
+[Unit]
+Description=Grow the Jetson TK1 root filesystem to fill /dev/sda1
+After=local-fs.target
+ConditionPathExists=!/var/lib/tk1-grow-rootfs/done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tk1-grow-rootfs
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
 mkdir -p /etc/systemd/network /etc/systemd/system/serial-getty@ttyS0.service.d
@@ -79,7 +120,7 @@ apt-get install -y --no-install-recommends \
 
 install -d -m 0755 /etc/docker
 if [[ "$variant" == nvidia ]]; then
-  apt-get install -y --no-install-recommends ocl-icd-libopencl1 clinfo xserver-xorg-core xinit
+  apt-get install -y --no-install-recommends xserver-xorg-core xinit
   cat > /etc/docker/daemon.json <<'EOF'
 {
   "storage-driver": "vfs",
@@ -103,10 +144,11 @@ overlay
 EOF
 fi
 
+test -f /lib/systemd/system/systemd-resolved.service
 systemctl enable systemd-networkd.service systemd-resolved.service
 systemctl enable ssh.service docker.service serial-getty@ttyS0.service
+systemctl enable fstrim.timer tk1-grow-rootfs.service
 systemctl set-default multi-user.target
-ln -snf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
 rm -f /usr/sbin/policy-rc.d
 apt-get clean
