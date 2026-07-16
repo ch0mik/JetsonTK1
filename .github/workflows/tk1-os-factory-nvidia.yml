@@ -1,93 +1,145 @@
-name: Jetson TK1 OS Factory - (NVIDIA Kernel + CUDA)
+name: Jetson TK1 OS Factory - NVIDIA L4T
 
 on:
   workflow_dispatch:
+    inputs:
+      rootfs_size_mib:
+        description: Size of the ext4 root partition in MiB
+        required: true
+        default: "4096"
+        type: string
+      release_tag:
+        description: Optional release tag (generated when empty)
+        required: false
+        type: string
+      publish_release:
+        description: Publish the result as a GitHub Release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tk1-nvidia-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  L4T_VERSION: R21.8
+  L4T_ARCHIVE: Tegra124_Linux_R21.8.0_armhf.tbz2
+  L4T_SHA1: 5a1ebb2cc1f851ef36baa19736500588efeb9756
+  ROOTFS_SIZE_MIB: ${{ inputs.rootfs_size_mib }}
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build Debian and NVIDIA L4T image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          qemu-user-static binfmt-support debootstrap \
-          wget rsync e2fsprogs dosfstools \
-          device-tree-compiler parted zip
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binfmt-support qemu-user-static debootstrap \
+            bzip2 curl rsync e2fsprogs parted xz-utils
 
-    - name: Download L4T 21.8
-      run: |
-        wget --content-disposition "https://developer.nvidia.com/linux-tegra-r218" -O Tegra124_Linux_R21.8.0_armhf.tbz2
-        wget --content-disposition "https://developer.nvidia.com/linux-tegra-sample-root-filesystem-r218" -O Tegra_Linux_Sample-Root-Filesystem_R21.8.0_armhf.tbz2
-        tar xjf Tegra124_Linux_R21.8.0_armhf.tbz2
+      - name: Build Debian 12 armhf rootfs
+        run: sudo bash ./scripts/build-rootfs.sh rootfs nvidia
 
-    - name: Extract L4T rootfs
-      run: |
-        cd Linux_for_Tegra/rootfs
-        sudo tar xjf ../../Tegra_Linux_Sample-Root-Filesystem_R21.8.0_armhf.tbz2
-        cd ..
-        sudo ./apply_binaries.sh
+      - name: Download and verify NVIDIA L4T 21.8
+        run: |
+          set -Eeuo pipefail
+          url="https://developer.download.nvidia.com/embedded/L4T/r21_Release_v8.0/release_files/$L4T_ARCHIVE"
+          curl --fail --location --retry 3 --output "$L4T_ARCHIVE" "$url"
+          echo "$L4T_SHA1  $L4T_ARCHIVE" | sha1sum --check --strict
+          tar -xjf "$L4T_ARCHIVE"
 
-    - name: Build Debian 12 rootfs
-      run: |
-        sudo mkdir debian-rootfs
-        sudo debootstrap --arch=armhf bookworm debian-rootfs http://deb.debian.org/debian
-        sudo cp /usr/bin/qemu-arm-static debian-rootfs/usr/bin/
+      - name: Install NVIDIA drivers and CUDA 6.5
+        run: |
+          sudo bash ./scripts/install-nvidia-userspace.sh rootfs Linux_for_Tegra
+          zimage=$(find Linux_for_Tegra -type f -name zImage -print -quit)
+          dtb=$(find Linux_for_Tegra -type f -name tegra124-jetson-tk1.dtb -print -quit)
+          test -n "$zimage"
+          test -n "$dtb"
+          mkdir -p kernel-out
+          cp "$zimage" kernel-out/zImage
+          cp "$dtb" kernel-out/tegra124-jetson-tk1.dtb
 
-    - name: Configure Debian
-      run: |
-        sudo chroot debian-rootfs /bin/bash -c "
-          echo 'jetson-tk1' > /etc/hostname
-          apt-get update
-          apt-get install -y locales sudo net-tools iproute2 openssh-server ca-certificates \
-            ocl-icd-libopencl1 curl gnupg
-          locale-gen en_US.UTF-8
-        "
+          kernel_release=$(find rootfs/lib/modules -mindepth 1 -maxdepth 1 \
+            -type d -printf '%f\n' | grep '^3\.10' | head -n 1)
+          test -n "$kernel_release"
+          echo "KERNEL_RELEASE=$kernel_release" >> "$GITHUB_ENV"
 
-    - name: Install Docker CE
-      run: |
-        sudo chroot debian-rootfs /bin/bash -c "
-          install -m 0755 -d /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-          echo 'deb [arch=armhf signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable' \
-            > /etc/apt/sources.list.d/docker.list
-          apt-get update
-          apt-get install -y docker-ce docker-ce-cli containerd.io
-        "
+      - name: Finalize rootfs and create images
+        run: |
+          sudo bash ./scripts/finalize-rootfs.sh rootfs "$KERNEL_RELEASE"
+          sudo --preserve-env=GITHUB_SHA,GITHUB_RUN_ID,ROOTFS_SIZE_MIB \
+            bash ./scripts/build-image.sh \
+              rootfs nvidia kernel-out/zImage \
+              kernel-out/tegra124-jetson-tk1.dtb \
+              "$KERNEL_RELEASE" release
+          sudo chown -R "$USER:$USER" release
 
-    - name: Inject Tegra drivers and CUDA 6.5
-      run: |
-        sudo rsync -av Linux_for_Tegra/rootfs/usr/lib/arm-linux-gnueabihf/tegra/ debian-rootfs/usr/lib/arm-linux-gnueabihf/tegra/
-        sudo rsync -av Linux_for_Tegra/rootfs/lib/firmware/ debian-rootfs/lib/firmware/
-        sudo rsync -av Linux_for_Tegra/rootfs/lib/modules/ debian-rootfs/lib/modules/
-        sudo rsync -av Linux_for_Tegra/rootfs/usr/local/cuda-6.5 debian-rootfs/usr/local/
+      - name: Verify release payload
+        run: |
+          set -Eeuo pipefail
+          cd release
+          sha256sum --check SHA256SUMS
+          test "$(find . -maxdepth 1 -name '*.img.xz' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*-components.tar.xz' | wc -l)" -eq 1
+          tar -tf ./*-components.tar.xz | grep -q './boot/extlinux/extlinux.conf'
+          tar -tf ./*-components.tar.xz | grep -q './rootfs.ext4'
 
-    - name: Build rootfs.ext4
-      run: |
-        dd if=/dev/zero of=rootfs.ext4 bs=1M count=4096
-        mkfs.ext4 rootfs.ext4
-        mkdir mnt
-        sudo mount -o loop rootfs.ext4 mnt
-        sudo rsync -av debian-rootfs/ mnt/
-        sudo umount mnt
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetson-tk1-nvidia-debian12
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
 
-    - name: Create ZIP package
-      run: |
-        mkdir output
-        cp rootfs.ext4 output/
-        cp Linux_for_Tegra/bootloader/zImage output/
-        cp Linux_for_Tegra/kernel/dtb/tegra124-jetson-tk1.dtb output/
-        zip -r variantA.zip output
+  release:
+    name: Publish GitHub Release
+    if: ${{ inputs.publish_release }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
 
-    - name: Release ZIP
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: tk1-variantA
-        name: Jetson TK1 Variant A (NVIDIA Kernel + CUDA)
-        files: nvidia.zip
+    steps:
+      - name: Download workflow artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jetson-tk1-nvidia-debian12
+          path: release
 
-        
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -Eeuo pipefail
+          tag=${REQUESTED_TAG:-tk1-nvidia-l4t21.8-r${GITHUB_RUN_NUMBER}}
+          title="Jetson TK1 NVIDIA L4T 21.8 + Debian 12"
+          notes=$(cat <<'EOF'
+          NVIDIA kernel 3.10.40, proprietary Tegra drivers, CUDA 6.5, OpenCL,
+          Docker CE and Debian 12 armhf.
+
+          This is an experimental hybrid userspace. Verify the download with
+          `sha256sum -c SHA256SUMS` and read README.md before flashing.
+          EOF
+          )
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" release/* \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$title" --notes "$notes"
+          fi

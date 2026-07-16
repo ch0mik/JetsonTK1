@@ -1,91 +1,172 @@
-name: Jetson TK1 OS Factory - (Mainline Kernel + Nouveau)
+name: Jetson TK1 OS Factory - Mainline
 
 on:
   workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: Mainline LTS kernel version
+        required: true
+        default: 6.12.95
+        type: string
+      rootfs_size_mib:
+        description: Size of the ext4 root partition in MiB
+        required: true
+        default: "4096"
+        type: string
+      release_tag:
+        description: Optional release tag (generated when empty)
+        required: false
+        type: string
+      publish_release:
+        description: Publish the result as a GitHub Release
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tk1-mainline-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  KERNEL_VERSION: ${{ inputs.kernel_version }}
+  ROOTFS_SIZE_MIB: ${{ inputs.rootfs_size_mib }}
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: Build Debian and mainline image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          qemu-user-static binfmt-support debootstrap \
-          wget rsync e2fsprogs dosfstools \
-          device-tree-compiler parted zip bc build-essential
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binfmt-support qemu-user-static debootstrap \
+            gcc-arm-linux-gnueabihf binutils-arm-linux-gnueabihf \
+            bc bison build-essential flex libssl-dev libelf-dev \
+            device-tree-compiler rsync e2fsprogs parted xz-utils curl
 
-    - name: Install ARM cross compiler
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          gcc-arm-linux-gnueabihf \
-          g++-arm-linux-gnueabihf \
-          binutils-arm-linux-gnueabihf
+      - name: Build Debian 12 armhf rootfs
+        run: sudo bash ./scripts/build-rootfs.sh rootfs mainline
 
+      - name: Download and verify kernel source
+        run: |
+          set -Eeuo pipefail
+          base_url=https://cdn.kernel.org/pub/linux/kernel/v6.x
+          archive="linux-${KERNEL_VERSION}.tar.xz"
+          curl --fail --location --retry 3 --remote-name "$base_url/$archive"
+          curl --fail --location --retry 3 --output sha256sums.asc \
+            "$base_url/sha256sums.asc"
+          grep "  $archive$" sha256sums.asc | sha256sum --check --strict
+          tar -xf "$archive"
 
-    - name: Build mainline kernel (6.x)
-      run: |
-        wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.6.tar.xz
-        tar xf linux-6.6.tar.xz
-        cd linux-6.6
-        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- tegra_defconfig
-        make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j$(nproc)
-        mkdir ../kernel-out
-        cp arch/arm/boot/zImage ../kernel-out/
-        cp arch/arm/boot/dts/tegra124-jetson-tk1.dtb ../kernel-out/
+      - name: Configure and build mainline kernel
+        run: |
+          set -Eeuo pipefail
+          cd "linux-${KERNEL_VERSION}"
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- tegra_defconfig
+          scripts/kconfig/merge_config.sh -m .config \
+            ../scripts/config/kernel-docker.fragment
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- olddefconfig
 
-    - name: Build Debian 12 rootfs
-      run: |
-        sudo mkdir debian-rootfs
-        sudo debootstrap --arch=armhf bookworm debian-rootfs http://deb.debian.org/debian
-        sudo cp /usr/bin/qemu-arm-static debian-rootfs/usr/bin/
+          for option in \
+            CONFIG_CGROUPS CONFIG_NAMESPACES CONFIG_NET_NS CONFIG_SECCOMP \
+            CONFIG_EXT4_FS CONFIG_DRM_TEGRA CONFIG_FW_LOADER; do
+            grep -q "^${option}=y$" .config
+          done
+          for option in CONFIG_OVERLAY_FS CONFIG_BRIDGE CONFIG_VETH CONFIG_DRM_NOUVEAU; do
+            grep -Eq "^${option}=(y|m)$" .config
+          done
 
-    - name: Configure Debian
-      run: |
-        sudo chroot debian-rootfs /bin/bash -c "
-          echo 'jetson-tk1' > /etc/hostname
-          apt-get update
-          apt-get install -y locales sudo net-tools iproute2 openssh-server ca-certificates \
-            curl gnupg mesa-utils
-          locale-gen en_US.UTF-8
-        "
+          make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- -j"$(nproc)" \
+            zImage dtbs modules
+          kernel_release=$(make -s ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- kernelrelease)
+          echo "KERNEL_RELEASE=$kernel_release" >> "$GITHUB_ENV"
+          sudo make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
+            INSTALL_MOD_PATH="$GITHUB_WORKSPACE/rootfs" INSTALL_MOD_STRIP=1 \
+            modules_install
+          sudo install -m 0644 .config \
+            "$GITHUB_WORKSPACE/rootfs/boot/config-$kernel_release"
+          sudo install -m 0644 System.map \
+            "$GITHUB_WORKSPACE/rootfs/boot/System.map-$kernel_release"
 
-    - name: Install Docker CE
-      run: |
-        sudo chroot debian-rootfs /bin/bash -c "
-          install -m 0755 -d /etc/apt/keyrings
-          curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-          echo 'deb [arch=armhf signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable' \
-            > /etc/apt/sources.list.d/docker.list
-          apt-get update
-          apt-get install -y docker-ce docker-ce-cli containerd.io
-        "
+          dtb=$(find arch/arm/boot/dts -type f -name tegra124-jetson-tk1.dtb -print -quit)
+          test -n "$dtb"
+          mkdir -p "$GITHUB_WORKSPACE/kernel-out"
+          cp arch/arm/boot/zImage "$GITHUB_WORKSPACE/kernel-out/zImage"
+          cp "$dtb" "$GITHUB_WORKSPACE/kernel-out/tegra124-jetson-tk1.dtb"
 
-    - name: Build rootfs.ext4
-      run: |
-        dd if=/dev/zero of=rootfs.ext4 bs=1M count=4096
-        mkfs.ext4 rootfs.ext4
-        mkdir mnt
-        sudo mount -o loop rootfs.ext4 mnt
-        sudo rsync -av debian-rootfs/ mnt/
-        sudo umount mnt
+      - name: Finalize rootfs and create images
+        run: |
+          sudo bash ./scripts/finalize-rootfs.sh rootfs "$KERNEL_RELEASE"
+          sudo --preserve-env=GITHUB_SHA,GITHUB_RUN_ID,ROOTFS_SIZE_MIB \
+            bash ./scripts/build-image.sh \
+              rootfs mainline kernel-out/zImage \
+              kernel-out/tegra124-jetson-tk1.dtb \
+              "$KERNEL_RELEASE" release
+          sudo chown -R "$USER:$USER" release
 
-    - name: Create ZIP package
-      run: |
-        mkdir output
-        cp rootfs.ext4 output/
-        cp kernel-out/zImage output/
-        cp kernel-out/tegra124-jetson-tk1.dtb output/
-        zip -r variantB.zip output
+      - name: Verify release payload
+        run: |
+          set -Eeuo pipefail
+          cd release
+          sha256sum --check SHA256SUMS
+          test "$(find . -maxdepth 1 -name '*.img.xz' | wc -l)" -eq 1
+          test "$(find . -maxdepth 1 -name '*-components.tar.xz' | wc -l)" -eq 1
+          tar -tf ./*-components.tar.xz | grep -q './boot/extlinux/extlinux.conf'
+          tar -tf ./*-components.tar.xz | grep -q './rootfs.ext4'
 
-    - name: Release ZIP
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: tk1-variantB
-        name: Jetson TK1 Variant B (Mainline Kernel + Nouveau)
-        files: mainline.zip
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetson-tk1-mainline-debian12
+          path: release/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    if: ${{ inputs.publish_release }}
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download workflow artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: jetson-tk1-mainline-debian12
+          path: release
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -Eeuo pipefail
+          tag=${REQUESTED_TAG:-tk1-mainline-${KERNEL_VERSION}-r${GITHUB_RUN_NUMBER}}
+          title="Jetson TK1 Mainline ${KERNEL_VERSION} + Debian 12"
+          notes=$(cat <<EOF
+          Mainline Linux ${KERNEL_VERSION}, Nouveau/Mesa, Docker CE and Debian 12 armhf.
+
+          Verify the download with \`sha256sum -c SHA256SUMS\` before flashing.
+          See README.md for bootloader requirements and first-login instructions.
+          EOF
+          )
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" release/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" release/* \
+              --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "$title" --notes "$notes"
+          fi
