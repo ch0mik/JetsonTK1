@@ -31,7 +31,10 @@ if ! bash "$script_dir/run-in-rootfs.sh" "$rootfs" \
     for path in \
       /bin /lib /bin/udevadm /usr/bin/udevadm \
       /lib/systemd/systemd-udevd /etc/udev/udev.conf \
-      /lib/udev/ata_id /lib/udev/scsi_id /sbin/blkid; do
+      /lib/udev/ata_id /lib/udev/scsi_id /sbin/blkid \
+      /lib/udev/rules.d/55-dm.rules \
+      /lib/udev/rules.d/60-persistent-storage-dm.rules \
+      /lib/udev/rules.d/95-dm-notify.rules; do
       ls -ld "$path" 2>&1 || true
       if [ -L "$path" ]; then
         readlink "$path" 2>&1 || true

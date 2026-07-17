@@ -10,12 +10,12 @@ rootfs=$(readlink -f "${1:?usage: install-nvidia-userspace.sh ROOTFS L4T_DIR}")
 l4t_dir=$(readlink -f "${2:?usage: install-nvidia-userspace.sh ROOTFS L4T_DIR}")
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-# R21.8's overlay removes modern udev helpers that were already installed by
-# Debian. Preserve them because Bookworm's initramfs hook requires both when
-# assembling persistent-storage support.
-udev_helper_backup=$(mktemp -d)
+# R21.8's overlay removes modern udev helpers and rules that were already
+# installed by Debian. Preserve them because Bookworm's initramfs hooks need
+# these files when assembling persistent-storage support.
+udev_backup=$(mktemp -d)
 cleanup() {
-  rm -rf "$udev_helper_backup"
+  rm -rf "$udev_backup"
 }
 trap cleanup EXIT
 for helper in ata_id scsi_id; do
@@ -24,22 +24,32 @@ for helper in ata_id scsi_id; do
     echo "Debian udev helper is missing before apply_binaries.sh: $helper_path" >&2
     exit 1
   fi
-  install -m 0755 "$helper_path" "$udev_helper_backup/$helper"
+  install -m 0755 "$helper_path" "$udev_backup/$helper"
 done
+udev_rules="$rootfs/usr/lib/udev/rules.d"
+if [[ ! -d "$udev_rules" ]]; then
+  echo "Debian udev rules are missing before apply_binaries.sh: $udev_rules" >&2
+  exit 1
+fi
+install -d -m 0755 "$udev_backup/rules.d"
+cp -a "$udev_rules/." "$udev_backup/rules.d/"
 
 rm -rf "$l4t_dir/rootfs"
 ln -s "$rootfs" "$l4t_dir/rootfs"
 (cd "$l4t_dir" && ./apply_binaries.sh)
 
-install -d -m 0755 "$rootfs/usr/lib/udev" "$rootfs/lib/udev"
+install -d -m 0755 \
+  "$rootfs/usr/lib/udev/rules.d" "$rootfs/lib/udev/rules.d"
 for helper in ata_id scsi_id; do
-  install -m 0755 "$udev_helper_backup/$helper" \
+  install -m 0755 "$udev_backup/$helper" \
     "$rootfs/usr/lib/udev/$helper"
   # apply_binaries.sh can turn Debian's /lib symlink into a separate legacy
   # directory. The Bookworm initramfs hook still calls these /lib paths.
-  install -m 0755 "$udev_helper_backup/$helper" \
+  install -m 0755 "$udev_backup/$helper" \
     "$rootfs/lib/udev/$helper"
 done
+cp -a "$udev_backup/rules.d/." "$rootfs/usr/lib/udev/rules.d/"
+cp -a "$udev_backup/rules.d/." "$rootfs/lib/udev/rules.d/"
 
 # L4T R21.8 predates merged-/usr. Its apply_binaries.sh can remove the
 # top-level ARMHF interpreter link from a modern Debian rootfs, after which
@@ -97,12 +107,16 @@ if ! bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/bash -c \
   'test -x /bin/udevadm &&
    test -x /lib/systemd/systemd-udevd &&
    test -x /lib/udev/ata_id &&
-   test -x /lib/udev/scsi_id'; then
-  echo "failed to repair the udev executables required by initramfs-tools" >&2
+   test -x /lib/udev/scsi_id &&
+   test -r /lib/udev/rules.d/55-dm.rules &&
+   test -r /lib/udev/rules.d/60-persistent-storage-dm.rules &&
+   test -r /lib/udev/rules.d/95-dm-notify.rules'; then
+  echo "failed to repair the udev files required by initramfs-tools" >&2
   ls -ld "$rootfs/bin" "$rootfs/lib" "$udevadm_bin" "$udevadm_usr" \
     "$systemd_udevd" "$rootfs/lib/udev/ata_id" \
     "$rootfs/lib/udev/scsi_id" "$rootfs/usr/lib/udev/ata_id" \
-    "$rootfs/usr/lib/udev/scsi_id" >&2 || true
+    "$rootfs/usr/lib/udev/scsi_id" "$rootfs/lib/udev/rules.d/"*dm*.rules \
+    >&2 || true
   exit 1
 fi
 install -d -m 0755 "$rootfs/etc/udev"
