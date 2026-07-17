@@ -29,7 +29,7 @@ if ! bash "$script_dir/run-in-rootfs.sh" "$rootfs" \
   echo "update-initramfs failed; udev path diagnostics:" >&2
   bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/bash -c '
     for path in \
-      /bin /bin/udevadm /usr/bin/udevadm \
+      /bin /lib /bin/udevadm /usr/bin/udevadm \
       /lib/systemd/systemd-udevd /etc/udev/udev.conf \
       /lib/udev/ata_id /lib/udev/scsi_id /sbin/blkid; do
       ls -ld "$path" 2>&1 || true

@@ -31,10 +31,14 @@ rm -rf "$l4t_dir/rootfs"
 ln -s "$rootfs" "$l4t_dir/rootfs"
 (cd "$l4t_dir" && ./apply_binaries.sh)
 
-install -d -m 0755 "$rootfs/usr/lib/udev"
+install -d -m 0755 "$rootfs/usr/lib/udev" "$rootfs/lib/udev"
 for helper in ata_id scsi_id; do
   install -m 0755 "$udev_helper_backup/$helper" \
     "$rootfs/usr/lib/udev/$helper"
+  # apply_binaries.sh can turn Debian's /lib symlink into a separate legacy
+  # directory. The Bookworm initramfs hook still calls these /lib paths.
+  install -m 0755 "$udev_helper_backup/$helper" \
+    "$rootfs/lib/udev/$helper"
 done
 
 # L4T R21.8 predates merged-/usr. Its apply_binaries.sh can remove the
@@ -95,8 +99,9 @@ if ! bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/bash -c \
    test -x /lib/udev/ata_id &&
    test -x /lib/udev/scsi_id'; then
   echo "failed to repair the udev executables required by initramfs-tools" >&2
-  ls -ld "$rootfs/bin" "$udevadm_bin" "$udevadm_usr" \
-    "$systemd_udevd" "$rootfs/usr/lib/udev/ata_id" \
+  ls -ld "$rootfs/bin" "$rootfs/lib" "$udevadm_bin" "$udevadm_usr" \
+    "$systemd_udevd" "$rootfs/lib/udev/ata_id" \
+    "$rootfs/lib/udev/scsi_id" "$rootfs/usr/lib/udev/ata_id" \
     "$rootfs/usr/lib/udev/scsi_id" >&2 || true
   exit 1
 fi
