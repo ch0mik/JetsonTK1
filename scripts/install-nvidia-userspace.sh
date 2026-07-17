@@ -10,9 +10,32 @@ rootfs=$(readlink -f "${1:?usage: install-nvidia-userspace.sh ROOTFS L4T_DIR}")
 l4t_dir=$(readlink -f "${2:?usage: install-nvidia-userspace.sh ROOTFS L4T_DIR}")
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# R21.8's overlay removes modern udev helpers that were already installed by
+# Debian. Preserve them because Bookworm's initramfs hook requires both when
+# assembling persistent-storage support.
+udev_helper_backup=$(mktemp -d)
+cleanup() {
+  rm -rf "$udev_helper_backup"
+}
+trap cleanup EXIT
+for helper in ata_id scsi_id; do
+  helper_path="$rootfs/usr/lib/udev/$helper"
+  if [[ ! -x "$helper_path" ]]; then
+    echo "Debian udev helper is missing before apply_binaries.sh: $helper_path" >&2
+    exit 1
+  fi
+  install -m 0755 "$helper_path" "$udev_helper_backup/$helper"
+done
+
 rm -rf "$l4t_dir/rootfs"
 ln -s "$rootfs" "$l4t_dir/rootfs"
 (cd "$l4t_dir" && ./apply_binaries.sh)
+
+install -d -m 0755 "$rootfs/usr/lib/udev"
+for helper in ata_id scsi_id; do
+  install -m 0755 "$udev_helper_backup/$helper" \
+    "$rootfs/usr/lib/udev/$helper"
+done
 
 # L4T R21.8 predates merged-/usr. Its apply_binaries.sh can remove the
 # top-level ARMHF interpreter link from a modern Debian rootfs, after which
@@ -67,10 +90,14 @@ if [[ ! -e "$systemd_udevd" && ! -L "$systemd_udevd" ]]; then
   ln -s /bin/udevadm "$systemd_udevd"
 fi
 if ! bash "$script_dir/run-in-rootfs.sh" "$rootfs" /bin/bash -c \
-  'test -x /bin/udevadm && test -x /lib/systemd/systemd-udevd'; then
+  'test -x /bin/udevadm &&
+   test -x /lib/systemd/systemd-udevd &&
+   test -x /lib/udev/ata_id &&
+   test -x /lib/udev/scsi_id'; then
   echo "failed to repair the udev executables required by initramfs-tools" >&2
   ls -ld "$rootfs/bin" "$udevadm_bin" "$udevadm_usr" \
-    "$systemd_udevd" >&2 || true
+    "$systemd_udevd" "$rootfs/usr/lib/udev/ata_id" \
+    "$rootfs/usr/lib/udev/scsi_id" >&2 || true
   exit 1
 fi
 install -d -m 0755 "$rootfs/etc/udev"
