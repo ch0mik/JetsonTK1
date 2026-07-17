@@ -20,6 +20,10 @@ grep -qx 'CONFIG_BLK_DEV_INITRD=y' "$kernel_config" || {
   echo "$kernel_config does not enable CONFIG_BLK_DEV_INITRD" >&2
   exit 1
 }
+# Bookworm's udev initramfs hook searches this directory unconditionally, but
+# a minimal rootfs without systemd-networkd does not create it.
+bash "$script_dir/run-in-rootfs.sh" "$rootfs" \
+  install -d -m 0755 /lib/systemd/network
 if ! bash "$script_dir/run-in-rootfs.sh" "$rootfs" \
   update-initramfs -v -c -k "$kernel_version"; then
   echo "update-initramfs failed; udev path diagnostics:" >&2
