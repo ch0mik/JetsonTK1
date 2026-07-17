@@ -40,6 +40,7 @@ if ! bash "$script_dir/run-in-rootfs.sh" "$rootfs" \
         readlink "$path" 2>&1 || true
       fi
     done
+    ls -ld /lib/klibc-*.so 2>&1 || true
     /bin/udevadm --version 2>&1 || true
     ldd /bin/udevadm 2>&1 || true
   ' >&2 || true
